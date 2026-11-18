@@ -49,6 +49,7 @@ TARGET = "https://pixel.mk69.dev"
 token = ""
 child = None
 last_note = ""
+next_auth = 0.0
 
 
 def note(msg):
@@ -136,11 +137,11 @@ def stop_board():
 
 
 def main():
-    global token
+    global token, next_auth
     note("supervisor старт, порт %d" % PORT)
     while True:
         init = read_init()
-        if init and (not token or not alive(token)):
+        if init and (not token or not alive(token)) and time.time() >= next_auth:
             new, expires, err = auth(init)
             if new:
                 token = new
@@ -154,8 +155,13 @@ def main():
                     note("pxboard подхватит токен сам, без перезапуска")
             elif err == "expired":
                 note("initdata протухла — положи новую строку в initdata.txt")
+                next_auth = time.time() + 600
+            elif err == "banned":
+                note("аккаунт забанен на сайте — обмен не пройдёт, жду 10 минут")
+                next_auth = time.time() + 600
             else:
                 note("авторизация не прошла: %s" % err)
+                next_auth = time.time() + 120
         elif not init:
             note("нет initdata.txt — только сервер без токена")
 

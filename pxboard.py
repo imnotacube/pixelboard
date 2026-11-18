@@ -180,8 +180,18 @@ def check_token():
         TOK.update(state="ok", code=200, checked=int(time.time() * 1000),
                    me=json.loads(raw), err="")
     except urllib.error.HTTPError as e:
-        TOK.update(state="dead" if e.code == 401 else "error", code=e.code,
-                   checked=int(time.time() * 1000), me=None, err="")
+        body = ""
+        try:
+            body = e.read().decode("utf-8", "replace")
+        except Exception:
+            pass
+        if e.code == 403 and "banned" in body:
+            state = "banned"
+        elif e.code == 401:
+            state = "dead"
+        else:
+            state = "error"
+        TOK.update(state=state, code=e.code, checked=int(time.time() * 1000), me=None, err=body[:120])
     except Exception as e:
         TOK.update(state="net", code=None, checked=int(time.time() * 1000),
                    me=TOK.get("me"), err=type(e).__name__)
@@ -431,6 +441,9 @@ tr.click{cursor:pointer}tr.click:hover td{background:#202020}
 .src{display:inline-block;width:5px;height:5px;border-radius:50%;margin-left:6px;vertical-align:2px;cursor:help}
 .src.local{background:#5FB8FF}
 .src.sample{background:#FF7A1A}
+.src-tag{font-size:9.5px;font-weight:400;letter-spacing:.03em;text-transform:none;margin-left:6px;white-space:nowrap}
+.src-tag.local{color:#5FB8FF}
+.src-tag.sample{color:#FF7A1A}
 .q:hover::after{content:attr(data-tip);position:absolute;left:-8px;top:17px;width:252px;padding:7px 9px;background:#0c0c0c;border:1px solid var(--acc);border-radius:5px;color:#dcdcdc;font-size:11px;line-height:1.45;white-space:normal;text-align:left;z-index:999;box-shadow:0 8px 24px #000c;pointer-events:none}
 </style></head><body>
 <header>
@@ -604,18 +617,30 @@ const SRC_SAMPLE = ["авторы", "памятники", "возраст кле
 
 function decorateSrc(){
   for (const el of document.querySelectorAll('.kv > span:first-child, .panel h2')){
-    if (el.querySelector('.src')) continue;
+    if (el.querySelector('.src') || el.querySelector('.src-tag')) continue;
     const raw = el.textContent.trim().toLowerCase();
     let kind = null;
     if (SRC_SAMPLE.some(k => raw.startsWith(k))) kind = 'sample';
     else if (SRC_LOCAL.some(k => raw.startsWith(k))) kind = 'local';
     if (!kind) continue;
-    const i = document.createElement('i');
-    i.className = 'src ' + kind;
-    i.title = kind === 'local'
-      ? 'считается локально: поле из canvas.bin, в api такой цифры нет'
-      : 'по выборке px.db, покрывает не всё поле';
-    el.appendChild(i);
+
+    if (el.tagName === 'H2'){
+      const tag = document.createElement('span');
+      tag.className = 'src-tag ' + kind;
+      tag.textContent = kind === 'sample' ? '(по выборке)' : '(локально)';
+      tag.title = kind === 'sample'
+        ? 'оценка по px.db: покрыто около 0.6% поля'
+        : 'считается локально по canvas.bin, в api такой цифры нет';
+      if (el.childNodes.length > 1) el.insertBefore(tag, el.childNodes[1]);
+      else el.appendChild(tag);
+    } else {
+      const i = document.createElement('i');
+      i.className = 'src ' + kind;
+      i.title = kind === 'local'
+        ? 'считается локально: поле из canvas.bin, в api такой цифры нет'
+        : 'по выборке px.db, покрывает не всё поле';
+      el.appendChild(i);
+    }
   }
 }
 
@@ -1265,9 +1290,12 @@ async function loadToken(){
   try{
     const t = await (await fetch('/token',{cache:'no-store'})).json();
     const el = $('tkState');
-    const names = {ok:'жив', dead:'протух', none:'нет токена', net:'сеть недоступна', error:'ошибка'};
+    const names = {ok:'жив', dead:'протух', none:'нет токена', net:'сеть недоступна',
+                   error:'ошибка', banned:'аккаунт забанен', checking:'проверка'};
     el.textContent = names[t.state] || t.state;
-    el.style.color = t.state === 'ok' ? 'var(--ok)' : (t.state === 'dead' ? 'var(--bad)' : 'var(--dim)');
+    el.style.color = t.state === 'ok' ? 'var(--ok)'
+      : (t.state === 'dead' || t.state === 'banned' || t.state === 'error') ? 'var(--bad)'
+      : 'var(--dim)';
     if (t.code && t.state !== 'ok') el.textContent += ' (' + t.code + ')';
 
     if (t.expires_at){
