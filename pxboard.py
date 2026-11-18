@@ -1140,10 +1140,10 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=8808)
     ap.add_argument("--host", default="127.0.0.1")
-    ap.add_argument("--token", default="")
+    ap.add_argument("--token", default="", help="bearer из /api/auth, либо переменная окружения PX_TOKEN")
     ap.add_argument("--db", default=DB_PATH)
     a = ap.parse_args()
-    TOKEN = a.token
+    TOKEN = a.token or os.environ.get("PX_TOKEN", "")
     DB_PATH = a.db
     threading.Thread(target=feed_loop, daemon=True).start()
     print("pxboard: http://%s:%d/  db=%s  token=%s"
