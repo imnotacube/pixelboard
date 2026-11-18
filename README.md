@@ -77,33 +77,6 @@ PX_TOKEN=L6xcJWu28x... python pxboard.py
 
 переменная читается только в `pxboard.py`, остальным скриптам токен не нужен.
 
-## как добыть токен
-
-1. открыть `https://web.telegram.org/a` в браузере с devtools.
-2. запустить мини-апп: бот `@exterapixelbattle_bot` → кнопка приложения.
-3. в консоли выполнить:
-
-```
-Telegram.WebApp.initData
-```
-
-получится строка `query_id=...&user=...&auth_date=...&hash=...`.
-
-4. обменять её на токен:
-
-```
-curl -s -X POST https://pixel.mk69.dev/api/auth ^
-  -H "Content-Type: application/json" ^
-  -H "User-Agent: Mozilla/5.0 (Linux; Android 14; Pixel 7) AppleWebKit/537.36 Chrome/120.0.0.0 Mobile Safari/537.36" ^
-  -d "{\"init_data\":\"query_id=...\"}"
-```
-
-ответ: `{"token":"...","expires_at":...,"me":{...}}`, в `--token` идёт поле `token`.
-
-важно: без мобильного `user-agent` сервер отвечает `403 {"err":"client"}`. это его проверка клиента, не ошибка запроса.
-
-аккаунт должен быть саппортером, иначе `not_supporter`.
-
 ## наполнение базы
 
 дашборд читает авторский слой из `px.db`. три способа:
