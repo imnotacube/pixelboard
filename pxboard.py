@@ -45,8 +45,9 @@ def _getaddrinfo(host, port, *a, **kw):
 socket.getaddrinfo = _getaddrinfo
 
 TARGET = "https://pixel.mk69.dev"
-UA = ("Mozilla/5.0 (Linux; Android 14; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) "
-      "Chrome/120.0.0.0 Mobile Safari/537.36")
+UA = "pixelboard"
+UA_FALLBACK = ("Mozilla/5.0 (Linux; Android 14; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) "
+               "Chrome/120.0.0.0 Mobile Safari/537.36")
 CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
 PBKDF2_ITER = 240000
 PASS_FAILS = collections.deque(maxlen=20)
@@ -201,25 +202,32 @@ def save_token(tok, expires=None, checking=True):
 
 
 def exchange_initdata(init):
+    """обмен init_data на токен. сервер отбивает не-браузерный user-agent
+    кодом 403 client, поэтому на такой ответ идёт один повтор с браузерным ua."""
     data = json.dumps({"init_data": init}).encode("utf-8")
-    req = urllib.request.Request(TARGET + "/api/auth", data=data, method="POST")
-    req.add_header("Content-Type", "application/json")
-    req.add_header("Accept", "application/json")
-    req.add_header("User-Agent", UA)
-    req.add_header("Origin", TARGET)
-    req.add_header("Referer", TARGET + "/")
-    try:
-        with urllib.request.urlopen(req, timeout=25) as r:
-            j = json.loads(r.read())
-        return j.get("token", ""), j.get("expires_at"), None
-    except urllib.error.HTTPError as e:
+    last = ("", None, "unknown")
+    for ua in (UA, UA_FALLBACK):
+        req = urllib.request.Request(TARGET + "/api/auth", data=data, method="POST")
+        req.add_header("Content-Type", "application/json")
+        req.add_header("Accept", "application/json")
+        req.add_header("User-Agent", ua)
+        req.add_header("Origin", TARGET)
+        req.add_header("Referer", TARGET + "/")
         try:
-            err = json.loads(e.read()).get("err", "http_%d" % e.code)
-        except Exception:
-            err = "http_%d" % e.code
-        return "", None, err
-    except Exception as e:
-        return "", None, type(e).__name__
+            with urllib.request.urlopen(req, timeout=25) as r:
+                j = json.loads(r.read())
+            return j.get("token", ""), j.get("expires_at"), None
+        except urllib.error.HTTPError as e:
+            try:
+                err = json.loads(e.read()).get("err", "http_%d" % e.code)
+            except Exception:
+                err = "http_%d" % e.code
+            last = ("", None, err)
+            if err != "client":
+                return last
+        except Exception as e:
+            return "", None, type(e).__name__
+    return last
 
 
 def check_token():
