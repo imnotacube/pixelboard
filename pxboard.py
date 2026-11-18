@@ -16,7 +16,6 @@ import io
 import json
 import os
 import socket
-import sqlite3
 import sys
 import threading
 import time
@@ -312,115 +311,23 @@ def feed_loop():
         time.sleep(1.0)
 
 
-# ---------------------------------------------------------------- база авторов
-
-
-def db_rows(sql, args=()):
-    if not os.path.exists(DB_PATH):
-        return []
-    c = sqlite3.connect(DB_PATH, timeout=10)
-    try:
-        return c.execute(sql, args).fetchall()
-    except sqlite3.Error:
-        return []
-    finally:
-        c.close()
+# ---------------------------------------------------------------- кланы и топ
 
 
 def clan_stats():
-    rows = db_rows("""SELECT clan, COUNT(*) n, COUNT(DISTINCT pid) m, MAX(ts) last
-                      FROM cells WHERE clan IS NOT NULL AND clan <> ''
-                      GROUP BY clan ORDER BY n DESC""")
-    attributed = db_rows("SELECT COUNT(*) FROM cells WHERE pid IS NOT NULL")
-    attributed = attributed[0][0] if attributed else 0
-    area = sum(r[1] for r in rows) or 0
-    clans = [{"tag": r[0], "cells": r[1], "members": r[2], "last": r[3],
-              "share": round(r[1] / area * 100, 2) if area else 0} for r in rows]
-    if TOKEN:
-        data = top_data()
-        if data.get("ok"):
-            by_tag = {c.get("tag"): c for c in data.get("clans", []) if isinstance(c, dict)}
-            for c in clans:
-                o = by_tag.get(c["tag"])
-                if o:
-                    c["official"] = {k: o.get(k) for k in ("pixels", "members", "cells", "rank", "name")}
-    return {"attributed": attributed, "area": area, "clans": clans, "token": bool(TOKEN)}
+    """кланы берутся только из /api/top, локальной базы больше нет."""
+    data = top_data()
+    if not data.get("ok"):
+        return {"ok": False, "err": data.get("err") or "no_token", "clans": [], "token": bool(TOKEN)}
+    clans = []
+    for c in data.get("clans", []):
+        if not isinstance(c, dict):
+            continue
+        clans.append({"tag": c.get("tag"), "cells": c.get("cells"), "pixels": c.get("pixels"),
+                      "members": c.get("members"), "rank": c.get("rank"), "name": c.get("name")})
+    return {"ok": True, "clans": clans, "token": bool(TOKEN),
+            "updated_at": data.get("updated_at")}
 
-
-def clan_pixels(tag, limit=12):
-    return db_rows("""SELECT name, pid, COUNT(*) n, MIN(ts) first, MAX(ts) last
-                      FROM cells WHERE clan = ? AND pid IS NOT NULL
-                      GROUP BY pid ORDER BY n DESC LIMIT ?""", (tag, limit))
-
-
-def progress():
-    done = db_rows("SELECT COUNT(*) FROM cells WHERE pid IS NOT NULL")
-    done = done[0][0] if done else 0
-    try:
-        painted = get_snapshot().get("painted") or 0
-    except Exception:
-        painted = 0
-    return {"done": done, "target": painted,
-            "pct": round(done / painted * 100, 2) if painted else 0}
-
-
-def clan_map():
-    rows = db_rows("SELECT DISTINCT clan FROM cells WHERE clan IS NOT NULL AND clan <> '' ORDER BY clan")
-    names = [r[0] for r in rows][:255]
-    index = {n: i + 1 for i, n in enumerate(names)}
-    grid = bytearray(512 * 512)
-    for idx, clan in db_rows("SELECT idx, clan FROM cells WHERE clan IS NOT NULL AND clan <> ''"):
-        i = index.get(clan)
-        if i:
-            grid[idx] = i
-    return {"names": names, "map": base64.b64encode(bytes(grid)).decode("ascii")}
-
-
-def author_map():
-    rows = db_rows("""SELECT pid, name, COUNT(*) n FROM cells
-                      WHERE pid IS NOT NULL GROUP BY pid ORDER BY n DESC LIMIT 254""")
-    names = [{"pid": r[0], "name": r[1], "cells": r[2]} for r in rows]
-    index = {r[0]: i + 1 for i, r in enumerate(rows)}
-    grid = bytearray(512 * 512)
-    for idx, pid in db_rows("SELECT idx, pid FROM cells WHERE pid IS NOT NULL"):
-        i = index.get(pid)
-        if i:
-            grid[idx] = i
-    return {"authors": names, "map": base64.b64encode(bytes(grid)).decode("ascii")}
-
-
-def age_map():
-    now = int(time.time() * 1000)
-    grid = bytearray(512 * 512)
-    hist = [0] * 8
-    buckets = [1, 3, 6, 12, 24, 48, 96, 10 ** 9]
-    for idx, ts in db_rows("SELECT idx, ts FROM cells WHERE ts IS NOT NULL AND pid IS NOT NULL"):
-        hours = max(0.0, (now - ts) / 3600000.0)
-        k = 0
-        while k < 7 and hours >= buckets[k]:
-            k += 1
-        hist[k] += 1
-        grid[idx] = k + 1
-    return {"map": base64.b64encode(bytes(grid)).decode("ascii"),
-            "hist": hist, "buckets": ["<1ч", "1-3ч", "3-6ч", "6-12ч", "12-24ч", "1-2д", "2-4д", "4д+"]}
-
-
-def monuments(limit=10):
-    rows = db_rows("""SELECT x, y, ts, pid, name, clan FROM cells
-                      WHERE ts IS NOT NULL AND pid IS NOT NULL ORDER BY ts ASC LIMIT ?""", (limit,))
-    return [{"x": r[0], "y": r[1], "ts": r[2], "pid": r[3], "name": r[4], "clan": r[5]} for r in rows]
-
-
-def neighbours(limit=12):
-    rows = db_rows("""SELECT a.clan, b.clan, COUNT(*) n FROM cells a JOIN cells b
-                      ON b.idx = a.idx + 1
-                      WHERE a.clan IS NOT NULL AND b.clan IS NOT NULL
-                        AND a.clan <> '' AND b.clan <> '' AND a.clan <> b.clan
-                      GROUP BY a.clan, b.clan ORDER BY n DESC LIMIT ?""", (limit,))
-    return [{"a": r[0], "b": r[1], "n": r[2]} for r in rows]
-
-
-CLAN_HIST = collections.deque(maxlen=20)
 
 _CACHE = {"top": (0.0, None), "clans": (0.0, None)}
 
@@ -455,17 +362,6 @@ def clan_list():
     if isinstance(d, dict) and isinstance(d.get("clans"), list):
         return {"ok": True, "clans": d["clans"]}
     return {"ok": False, "err": (d or {}).get("err", "unknown") if isinstance(d, dict) else "unknown"}
-
-
-def clan_delta():
-    cur = {r[0]: r[1] for r in db_rows(
-        "SELECT clan, COUNT(*) FROM cells WHERE clan IS NOT NULL AND clan <> '' GROUP BY clan")}
-    prev = CLAN_HIST[-1] if CLAN_HIST else {}
-    CLAN_HIST.append(cur)
-    out = []
-    for tag, n in cur.items():
-        out.append({"tag": tag, "cells": n, "delta": n - prev.get(tag, n)})
-    return sorted(out, key=lambda c: -c["cells"])
 
 
 # ---------------------------------------------------------------- HTML
@@ -537,7 +433,6 @@ tr.click{cursor:pointer}tr.click:hover td{background:#202020}
   <span class="badge" id="online">—</span>
   <span class="badge" id="timer">15s</span>
   <span class="badge" title="считается локально по canvas.bin, в api этого поля нет"><i class="src local"></i> локально</span>
-  <span class="badge" title="оценка по выборке px.db, не всё поле"><i class="src sample"></i> выборка</span>
   <span id="err"></span>
 </header>
 <main>
@@ -620,36 +515,19 @@ tr.click{cursor:pointer}tr.click:hover td{background:#202020}
         <button id="lFill">тайлы</button>
         <button id="lEdge">границы</button>
         <button id="lHot">горячие</button>
-        <button id="lClan">кланы</button>
-        <button id="lAuthor">авторы</button>
-        <button id="lAge">возраст</button>
         <button id="lGrid">сетка</button>
       </div>
-      <div class="legend" id="legend"></div>
     </div>
     <div class="panel">
       <h2>Кланы</h2>
       <table><thead><tr><th>клан</th><th class="num">пикселей</th><th class="num">на поле</th><th class="num">люди</th></tr></thead>
-      <tbody id="clanBody"><tr><td colspan="4" style="color:var(--dim)">нет авторского слоя</td></tr></tbody></table>
+      <tbody id="clanBody"><tr><td colspan="4" style="color:var(--dim)">нужен рабочий токен</td></tr></tbody></table>
       <div id="claninfo"></div>
     </div>
     <div class="panel">
       <h2>Топ игроков</h2>
       <table><thead><tr><th>#</th><th>имя</th><th class="num">пикселей</th><th class="num">клан</th></tr></thead>
       <tbody id="topBody"><tr><td colspan="4" style="color:var(--dim)">нужен рабочий токен</td></tr></tbody></table>
-    </div>
-    <div class="panel">
-      <h2>Авторы</h2>
-      <table><thead><tr><th>имя</th><th class="num">клетки</th><th class="num">доля</th></tr></thead>
-      <tbody id="authorBody"><tr><td colspan="3" style="color:var(--dim)">нет данных</td></tr></tbody></table>
-    </div>
-    <div class="panel">
-      <h2>Памятники</h2>
-      <div id="mono" style="color:var(--dim);font-size:11.5px">—</div>
-    </div>
-    <div class="panel">
-      <h2>Возраст клеток</h2>
-      <div id="ageBars"></div>
     </div>
     <div class="panel">
       <h2>Интервалы постановок</h2>
@@ -674,7 +552,7 @@ const S = {
   tileFill: new Float32Array(32 * 32), tileEdge: new Float32Array(32 * 32), tileHot: new Float32Array(32 * 32),
   revert: 0, dups: 0,
   clanMap: null, clanNames: [], authorMap: null, authorNames: [], ageMap: null, ageHist: null, ageBuckets: [],
-  layer: {diff: true, fill: false, edge: false, hot: false, clan: false, author: false, age: false, grid: false},
+  layer: {diff: true, fill: false, edge: false, hot: false, grid: false},
   view: {scale: 1, x: 0, y: 0},
   feed: [], feedSeen: 0, lastFeedAt: 0, prevSec: 0,
 };
@@ -703,32 +581,26 @@ const SRC_LOCAL = ["заполнено", "клетки", "цветов", "энт
   "прогноз заполнения", "z-score окна", "новых событий", "изменено клеток",
   "откатов цвета", "турбулентность", "рисунков", "крупнейший", "свободный блок",
   "дублей тайлов", "кольца ц/с/к", "лента постановок"];
-const SRC_SAMPLE = ["авторы", "памятники", "возраст клеток"];
 
 function decorateSrc(){
   for (const el of document.querySelectorAll('.kv > span:first-child, .panel h2')){
     if (el.querySelector('.src') || el.querySelector('.src-tag')) continue;
     const raw = el.textContent.trim().toLowerCase();
     let kind = null;
-    if (SRC_SAMPLE.some(k => raw.startsWith(k))) kind = 'sample';
-    else if (SRC_LOCAL.some(k => raw.startsWith(k))) kind = 'local';
+    if (SRC_LOCAL.some(k => raw.startsWith(k))) kind = 'local';
     if (!kind) continue;
 
     if (el.tagName === 'H2'){
       const tag = document.createElement('span');
       tag.className = 'src-tag ' + kind;
-      tag.textContent = kind === 'sample' ? '(по выборке)' : '(локально)';
-      tag.title = kind === 'sample'
-        ? 'оценка по px.db: покрыто около 0.6% поля'
-        : 'считается локально по canvas.bin, в api такой цифры нет';
+      tag.textContent = '(локально)';
+      tag.title = 'считается локально по canvas.bin, в api такой цифры нет';
       if (el.childNodes.length > 1) el.insertBefore(tag, el.childNodes[1]);
       else el.appendChild(tag);
     } else {
       const i = document.createElement('i');
       i.className = 'src ' + kind;
-      i.title = kind === 'local'
-        ? 'считается локально: поле из canvas.bin, в api такой цифры нет'
-        : 'по выборке px.db, покрывает не всё поле';
+      i.title = 'считается локально: поле из canvas.bin, в api такой цифры нет';
       el.appendChild(i);
     }
   }
@@ -911,37 +783,9 @@ function drawGrid(){
 
 function drawByteMap(map, names, seedFn){
   clearOverlay();
-  if (!map) return;
-  const img=oc.createImageData(S.w,S.h), d=img.data;
-  const cache = new Map();
-  for (let i=0;i<map.length;i++){
-    const k=map[i]; if(!k) continue;
-    let col = cache.get(k);
-    if (!col){ const seed = names[k-1] || String(k); col = hsl(seed); cache.set(k,col); }
-    const [h,s,l]=col.match(/[\d.]+/g).map(Number);
-    const v=hslToRgb(h/360,s/100,l/100), j=i*4;
-    d[j]=v[0]; d[j+1]=v[1]; d[j+2]=v[2]; d[j+3]=232;
-  }
-  oc.putImageData(img,0,0);
-}
-
-function drawAge(){
-  clearOverlay();
-  if (!S.ageMap) return;
-  const shades=[[0,0,0],[80,180,255],[70,150,235],[60,120,210],[120,90,200],[190,80,170],[230,90,90],[255,140,40]];
-  const img=oc.createImageData(S.w,S.h), d=img.data;
-  for (let i=0;i<S.ageMap.length;i++){
-    const k=S.ageMap[i]; if(!k) continue;
-    const v=shades[k-1]||[255,255,255], j=i*4;
-    d[j]=v[0]; d[j+1]=v[1]; d[j+2]=v[2]; d[j+3]=230;
-  }
-  oc.putImageData(img,0,0);
 }
 
 function repaintLayer(){
-  if (S.layer.age) return drawAge();
-  if (S.layer.author) return drawByteMap(S.authorMap, (S.authorNames||[]).map(a=>a.pid), null);
-  if (S.layer.clan) return drawByteMap(S.clanMap, S.clanNames, null);
   if (S.layer.hot) return drawTilesData('hot');
   if (S.layer.edge) return drawTilesData('edge');
   if (S.layer.fill) return drawTilesData('fill');
@@ -1188,99 +1032,39 @@ async function load(){
   }
 }
 
-/* ---------------- производные данные ---------------- */
+/* ---------------- кланы и топ из api ---------------- */
 async function loadDerived(){
+  let hasOfficial = false, err = "";
   try{
     const c = await (await fetch('/clans',{cache:'no-store'})).json();
-    let pr = {done:0,target:0,pct:0};
-    try { pr = await (await fetch('/progress',{cache:'no-store'})).json(); } catch(e){}
-    const painted = S.last && S.last.painted ? S.last.painted : 0;
+    hasOfficial = c.ok && c.clans.length > 0;
+    err = c.ok ? "" : (c.err || "");
     const body=$('clanBody'); body.innerHTML='';
-    const hasOfficial = c.clans.length > 0 && !!c.clans[0].official;
-    if (!c.clans.length){
-      body.innerHTML='<tr><td colspan="4" style="color:var(--dim)">нет авторского слоя</td></tr>';
+    if (!c.ok){
+      body.innerHTML='<tr><td colspan="4" style="color:var(--dim)">нужен токен: '+err+'</td></tr>';
+    } else if (!c.clans.length){
+      body.innerHTML='<tr><td colspan="4" style="color:var(--dim)">кланов нет</td></tr>';
     } else {
-      for (const k of c.clans.slice(0,10)){
-        const tr=document.createElement('tr'); tr.className='click';
-        const o = k.official || null;
-        const field = o && o.cells != null ? o.cells : Math.round(k.share/100*painted);
-        const px = o && o.pixels != null ? o.pixels.toLocaleString('ru-RU') : '—';
-        tr.innerHTML='<td style="color:'+hsl(k.tag)+'">'+k.tag+'</td>'
-          +'<td class="num">'+px+'</td>'
-          +'<td class="num">'+(o?'':'≈')+field.toLocaleString('ru-RU')+'</td>'
-          +'<td class="num">'+(o&&o.members!=null?o.members:k.members)+'</td>';
+      for (const k of c.clans.slice(0,12)){
+        const tr=document.createElement('tr');
+        tr.innerHTML='<td style="color:'+hsl(k.tag||'?')+'">'+(k.tag||'—')+'</td>'
+          +'<td class="num">'+(k.pixels!=null?k.pixels.toLocaleString('ru-RU'):'—')+'</td>'
+          +'<td class="num">'+(k.cells!=null?k.cells.toLocaleString('ru-RU'):'—')+'</td>'
+          +'<td class="num">'+(k.members!=null?k.members:'—')+'</td>';
         const info = S.clanInfo && S.clanInfo[k.tag];
         if (info) tr.title = (info.name || k.tag)
           + (info.owner ? ' · владелец ' + info.owner.name : '')
           + (info.description ? '\n' + info.description : '');
-        tr.onclick=()=>showClan(k.tag);
         body.appendChild(tr);
       }
     }
-    setText('claninfo','авторский слой: '+pr.done.toLocaleString('ru-RU')+' / '+pr.target.toLocaleString('ru-RU')
-      +' клеток ('+pr.pct+'%)'
-      + (hasOfficial ? ' · официальные цифры с сервера'
-         : (c.token ? ' · токен не принят, нужен новый' : ' · оценка по выборке, пиксели без токена недоступны')));
-  }catch(e){}
-
-  try{
-    const a = await (await fetch('/authors',{cache:'no-store'})).json();
-    S.authorNames=a.authors;
-    S.authorMap = a.map ? b64(a.map) : null;
-    const body=$('authorBody'); body.innerHTML='';
-    const total=a.authors.reduce((s,x)=>s+x.cells,0)||1;
-    a.authors.slice(0,10).forEach((x,i)=>{
-      const tr=document.createElement('tr');
-      tr.innerHTML='<td style="color:'+hsl(x.pid)+'">'+x.name+'</td>'
-        +'<td class="num">'+x.cells.toLocaleString('ru-RU')+'</td>'
-        +'<td class="num">'+(x.cells/total*100).toFixed(1)+'%</td>';
-      body.appendChild(tr);
-    });
-    if (!a.authors.length) body.innerHTML='<tr><td colspan="3" style="color:var(--dim)">нет данных</td></tr>';
-  }catch(e){}
-
-  try{
-    const g = await (await fetch('/age',{cache:'no-store'})).json();
-    S.ageMap = g.map ? b64(g.map) : null;
-    S.ageBuckets = g.buckets;
-    const max=Math.max(...g.hist,1);
-    $('ageBars').innerHTML = g.hist.map((v,i)=>
-      '<div class="kv"><span>'+g.buckets[i]+'</span><span>'+v.toLocaleString('ru-RU')+'</span></div>'
-      +'<div class="bar"><i style="width:'+(v/max*100).toFixed(1)+'%;background:linear-gradient(90deg,#2B74E0,#5FB8FF)"></i></div>'
-    ).join('');
-  }catch(e){}
-
-  try{
-    const m = await (await fetch('/monuments',{cache:'no-store'})).json();
-    $('mono').innerHTML = m.slice(0,8).map(p=>
-      '('+p.x+','+p.y+') <b style="color:'+hsl(p.pid)+'">'+p.name+'</b>'
-      + (p.clan?' ['+p.clan+']':'') + ' · ' + new Date(p.ts).toLocaleString('ru-RU',{hour12:false})
-    ).join('<br>') || '—';
-  }catch(e){}
-
-  try{ await loadClanMap(); }catch(e){}
+    setText('claninfo', hasOfficial
+      ? 'данные /api/top'
+      : (c.token ? 'токен не принят: ' + err : 'токен не задан'));
+  }catch(e){
+    setText('claninfo', 'ошибка: ' + e.message);
+  }
   decorate();
-}
-
-function b64(s){
-  const bin=atob(s), out=new Uint8Array(bin.length);
-  for (let i=0;i<bin.length;i++) out[i]=bin.charCodeAt(i);
-  return out;
-}
-
-async function showClan(tag){
-  const box=$('claninfo'); box.textContent=tag+': запрос…';
-  try{
-    const j=await (await fetch('/clan?tag='+encodeURIComponent(tag))).json();
-    box.innerHTML='<b>'+tag+'</b><br>'+j.players.slice(0,6).map(p=>'· '+p.name+' — '+p.cells).join('<br>');
-  }catch(e){ box.textContent='ошибка: '+e.message; }
-}
-
-async function loadClanMap(){
-  const j=await (await fetch('/clanmap',{cache:'no-store'})).json();
-  S.clanNames=j.names||[];
-  S.clanMap = j.map ? b64(j.map) : null;
-  $('legend').innerHTML = S.clanNames.slice(0,8).map(t=>'<span><i style="background:'+hsl(t)+'"></i>'+t+'</span>').join('');
 }
 
 /* ---------------- лента событий ---------------- */
@@ -1359,14 +1143,14 @@ function layerBtn(id, key){
     for (const k in S.layer) S.layer[k]=false;
     S.layer[key]=true;
     for (const [bid,bk] of [['lDiff','diff'],['lFill','fill'],['lEdge','edge'],['lHot','hot'],
-                            ['lClan','clan'],['lAuthor','author'],['lAge','age'],['lGrid','grid']]){
+                            ['lGrid','grid']]){
       $(bid).classList.toggle('on', bk===key);
     }
     repaintLayer();
   };
 }
 layerBtn('lDiff','diff'); layerBtn('lFill','fill'); layerBtn('lEdge','edge'); layerBtn('lHot','hot');
-layerBtn('lClan','clan'); layerBtn('lAuthor','author'); layerBtn('lAge','age'); layerBtn('lGrid','grid');
+layerBtn('lGrid','grid');
 
 $('btnNow').onclick = load;
 $('btnAuto').onclick = () => {
@@ -1485,7 +1269,6 @@ setInterval(loadToken, 30000);
 load();
 S.timer = setInterval(load, 15000);
 setInterval(pollFeed, 2000);
-setInterval(loadDerived, 60000);
 </script>
 </body></html>
 """
@@ -1574,29 +1357,11 @@ class Handler(BaseHTTPRequestHandler):
                 y = int(q.get("y", ["0"])[0])
                 return self._send(200, fetch("/api/cell?x=%d&y=%d" % (x, y)), "application/json")
             if p.path == "/clans":
-                data = clan_stats()
-                data["deltas"] = clan_delta()
-                by = {d["tag"]: d for d in data["deltas"]}
-                for c in data["clans"]:
-                    d = by.get(c["tag"])
-                    if d:
-                        c["delta"] = d["delta"]
-                return self._json(data)
-            if p.path == "/clan":
-                tag = q.get("tag", [""])[0]
-                return self._json({"tag": tag, "players": [
-                    {"name": r[0], "pid": r[1], "cells": r[2], "first": r[3], "last": r[4]}
-                    for r in clan_pixels(tag)]})
-            if p.path == "/clanmap":
-                return self._json(clan_map())
-            if p.path == "/authors":
-                return self._json(author_map())
+                return self._json(clan_stats())
             if p.path == "/top":
                 return self._json(top_data())
             if p.path == "/clanlist":
                 return self._json(clan_list())
-            if p.path == "/progress":
-                return self._json(progress())
             if p.path == "/token":
                 return self._json({
                     "has_token": bool(TOKEN),
@@ -1608,12 +1373,6 @@ class Handler(BaseHTTPRequestHandler):
                     "expires_at": TOKEN_META.get("expires_at"),
                     "updated": TOKEN_META.get("updated"),
                 })
-            if p.path == "/age":
-                return self._json(age_map())
-            if p.path == "/monuments":
-                return self._json(monuments())
-            if p.path == "/neighbours":
-                return self._json(neighbours())
             if p.path == "/events":
                 since = int(q.get("since", ["0"])[0] or 0)
                 ev = [e for e in list(EVENTS) if e["seq"] > since]
@@ -1632,7 +1391,6 @@ def main():
     ap.add_argument("--port", type=int, default=8808)
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--token", default="", help="bearer из /api/auth, либо переменная окружения PX_TOKEN")
-    ap.add_argument("--db", default=DB_PATH)
     ap.add_argument("--set-pass", action="store_true", help="задать парольную фразу для смены токена")
     a = ap.parse_args()
 
@@ -1664,11 +1422,10 @@ def main():
         TOKEN = read_token_file()
     TOKEN_META = read_meta_file()
 
-    DB_PATH = a.db
     threading.Thread(target=feed_loop, daemon=True).start()
     threading.Thread(target=token_loop, daemon=True).start()
-    print("pxboard: http://%s:%d/  db=%s  token=%s  pass=%s"
-          % (a.host, a.port, DB_PATH, "есть" if TOKEN else "нет",
+    print("pxboard: http://%s:%d/  token=%s  pass=%s"
+          % (a.host, a.port, "есть" if TOKEN else "нет",
              "задан" if pass_configured() else "не задан"))
     return ThreadingHTTPServer((a.host, a.port), Handler).serve_forever()
 
