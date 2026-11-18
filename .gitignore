@@ -2,6 +2,9 @@ px.db
 px.db-wal
 px.db-shm
 token.txt
+initdata.txt
+pxkeep.log
+pxkeep.err
 hits.jsonl
 field.jsonl
 snap.json

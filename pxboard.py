@@ -15,6 +15,7 @@ import collections
 import io
 import json
 import os
+import socket
 import sqlite3
 import sys
 import threading
@@ -26,6 +27,23 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 if hasattr(sys.stdout, "buffer"):
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+
+# локальный dns иногда отваливается: если имя не разрешилось, берём известный адрес
+PIN = {"pixel.mk69.dev": "109.120.137.32"}
+_gai = socket.getaddrinfo
+
+
+def _getaddrinfo(host, port, *a, **kw):
+    try:
+        return _gai(host, port, *a, **kw)
+    except socket.gaierror:
+        ip = PIN.get(host)
+        if ip:
+            return _gai(ip, port, *a, **kw)
+        raise
+
+
+socket.getaddrinfo = _getaddrinfo
 
 TARGET = "https://pixel.mk69.dev"
 CACHE_TTL = 2.0
@@ -264,6 +282,7 @@ HTML = r"""<!doctype html>
 body{margin:0;background:var(--bg);color:var(--fg);font:12.5px/1.45 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
 header{display:flex;align-items:center;gap:12px;padding:9px 14px;border-bottom:1px solid var(--line);background:#181818;position:sticky;top:0;z-index:5}
 h1{font-size:12px;font-weight:600;margin:0;letter-spacing:.06em}
+h1 .by{font-size:9.5px;font-weight:400;color:var(--dim);letter-spacing:.02em;margin-left:6px}
 .badge{padding:2px 7px;border:1px solid var(--line);border-radius:4px;color:var(--dim);white-space:nowrap}
 .badge.ok{color:var(--ok);border-color:#2E6B1E}
 .badge.bad{color:var(--bad);border-color:#5C0F1F}
@@ -308,7 +327,7 @@ tr.click{cursor:pointer}tr.click:hover td{background:#202020}
 .q:hover::after{content:attr(data-tip);position:absolute;left:-8px;top:17px;width:252px;padding:7px 9px;background:#0c0c0c;border:1px solid var(--acc);border-radius:5px;color:#dcdcdc;font-size:11px;line-height:1.45;white-space:normal;text-align:left;z-index:999;box-shadow:0 8px 24px #000c;pointer-events:none}
 </style></head><body>
 <header>
-  <h1>PIXELBOARD</h1>
+  <h1>PIXELBOARD<span class="by">by cubzx</span></h1>
   <span class="badge" id="conn">connecting</span>
   <span class="badge" id="phase">—</span>
   <span class="badge" id="online">—</span>
@@ -391,8 +410,8 @@ tr.click{cursor:pointer}tr.click:hover td{background:#202020}
     </div>
     <div class="panel">
       <h2>Кланы</h2>
-      <table><thead><tr><th>клан</th><th class="num">на поле</th><th class="num">покрытие</th><th class="num">пикселей</th><th class="num">люди</th></tr></thead>
-      <tbody id="clanBody"><tr><td colspan="5" style="color:var(--dim)">нет авторского слоя</td></tr></tbody></table>
+      <table><thead><tr><th>клан</th><th class="num">пикселей</th><th class="num">на поле</th><th class="num">люди</th></tr></thead>
+      <tbody id="clanBody"><tr><td colspan="4" style="color:var(--dim)">нет авторского слоя</td></tr></tbody></table>
       <div id="claninfo"></div>
     </div>
     <div class="panel">
@@ -427,7 +446,7 @@ const fimg = fc.createImageData(512, 512);
 const S = {
   w: 512, h: 512, pal: [], colors: null, prev: null, prev2: null,
   last: null, nextAt: 0, auto: true, timer: null,
-  fillHist: [], seqHist: [], changeHist: [],
+  fillHist: [], fillT: [], seqHist: [], changeHist: [],
   tileFill: new Float32Array(32 * 32), tileEdge: new Float32Array(32 * 32), tileHot: new Float32Array(32 * 32),
   revert: 0, dups: 0,
   clanMap: null, clanNames: [], authorMap: null, authorNames: [], ageMap: null, ageHist: null, ageBuckets: [],
@@ -493,6 +512,24 @@ function computeStats(c){
   }
   let ent=0; for (const n of cnt){ if(!n) continue; const p=n/c.length; ent-=p*Math.log2(p); }
   return {cnt, fill, edge, ent};
+}
+
+function countDiff(prev, cur){
+  let n = 0;
+  for (let i=0;i<cur.length;i++) if (prev[i] !== cur[i]) n++;
+  return n;
+}
+
+/* медианный наклон по всем парам точек: один выброс не сдвигает прогноз */
+function theilSen(ts, vs){
+  const n = ts.length, slopes = [];
+  for (let i=0;i<n;i++) for (let j=i+1;j<n;j++){
+    const dt = ts[j]-ts[i];
+    if (dt > 3000) slopes.push((vs[j]-vs[i])/dt);
+  }
+  if (!slopes.length) return 0;
+  slopes.sort((a,b)=>a-b);
+  return slopes[Math.floor(slopes.length/2)];
 }
 
 function tileStats(c){
@@ -788,11 +825,20 @@ async function load(){
     }
     const evDelta = (S.last && j.seq>=S.last.seq) ? j.seq-S.last.seq : null;
 
-    if (S.fillHist.length){
-      const lastFill=S.fillHist[S.fillHist.length-1];
-      S.rate = (st.fill-lastFill)/15*60;   // клеток в минуту
-    }
     S.fillHist.push(st.fill); if (S.fillHist.length>200) S.fillHist.shift();
+    S.fillT.push(j.fetchedAt || Date.now()); if (S.fillT.length>200) S.fillT.shift();
+
+    // наклон по медиане пар точек за последние 30 минут, потом сглаживание
+    if (S.fillT.length >= 6){
+      const win = Math.min(S.fillT.length, 120);
+      const ts = S.fillT.slice(-win), vs = S.fillHist.slice(-win);
+      const slope = theilSen(ts, vs);            // клеток в миллисекунду
+      S.rateRaw = slope * 60000;                 // клеток в минуту
+      S.rateWin = Math.round((ts[ts.length-1] - ts[0]) / 60000);
+      S.rate = (S.rate === undefined || S.rate === null)
+        ? S.rateRaw
+        : 0.7 * S.rate + 0.3 * S.rateRaw;
+    }
     if (evDelta!==null){ S.seqHist.push(evDelta); if(S.seqHist.length>40) S.seqHist.shift(); }
 
     // z-score
@@ -825,9 +871,21 @@ async function load(){
     setText('entropy', st.ent.toFixed(2)+' бит');
     setText('edges', st.edge.toLocaleString('ru-RU'));
     setText('seq', j.seq.toLocaleString('ru-RU'));
-    setText('rate', (S.rate??0).toFixed(1)+' кл/мин');
+    setText('rate', (S.rate===undefined||S.rate===null) ? '—'
+      : S.rate.toFixed(1)+' кл/мин'+(S.rateWin ? ' / '+S.rateWin+' мин' : ''));
     const left=(S.w*S.h)-st.fill;
-    setText('eta', (S.rate>0.5) ? (left/S.rate/60).toFixed(1)+' ч' : 'не растёт');
+    let etaText='мало данных';
+    if (S.rate !== undefined && S.rate !== null){
+      if (S.rate <= 0.5) etaText='не растёт';
+      else {
+        const hours = left/(S.rate*60);
+        etaText = hours < 1 ? Math.max(1, Math.round(hours*60))+' мин'
+                : hours < 48 ? hours.toFixed(1)+' ч'
+                : hours < 24*45 ? (hours/24).toFixed(1)+' сут'
+                : 'больше месяца';
+      }
+    }
+    setText('eta', etaText);
     setText('zscore', z);
     setText('winEv', evDelta===null?'—':evDelta);
     setText('winCells', changed?changed.toLocaleString('ru-RU'):'0');
@@ -877,26 +935,27 @@ async function loadDerived(){
     try { pr = await (await fetch('/progress',{cache:'no-store'})).json(); } catch(e){}
     const painted = S.last && S.last.painted ? S.last.painted : 0;
     const body=$('clanBody'); body.innerHTML='';
+    const hasOfficial = c.clans.length > 0 && !!c.clans[0].official;
     if (!c.clans.length){
-      body.innerHTML='<tr><td colspan="5" style="color:var(--dim)">нет авторского слоя</td></tr>';
+      body.innerHTML='<tr><td colspan="4" style="color:var(--dim)">нет авторского слоя</td></tr>';
     } else {
       for (const k of c.clans.slice(0,10)){
         const tr=document.createElement('tr'); tr.className='click';
         const o = k.official || null;
         const field = o && o.cells != null ? o.cells : Math.round(k.share/100*painted);
-        const cover = (o && o.cells != null) ? (o.cells/(S.w*S.h)*100) : k.share;
-        const px = o && o.pixels != null ? o.pixels : '—';
+        const px = o && o.pixels != null ? o.pixels.toLocaleString('ru-RU') : '—';
         tr.innerHTML='<td style="color:'+hsl(k.tag)+'">'+k.tag+'</td>'
+          +'<td class="num">'+px+'</td>'
           +'<td class="num">'+(o?'':'≈')+field.toLocaleString('ru-RU')+'</td>'
-          +'<td class="num"><div class="mini" style="width:'+Math.min(100,cover)+'%"></div>'+cover.toFixed(1)+'%</td>'
-          +'<td class="num">'+(px==='—'?'—':px.toLocaleString('ru-RU'))+'</td>'
           +'<td class="num">'+(o&&o.members!=null?o.members:k.members)+'</td>';
         tr.onclick=()=>showClan(k.tag);
         body.appendChild(tr);
       }
     }
     setText('claninfo','авторский слой: '+pr.done.toLocaleString('ru-RU')+' / '+pr.target.toLocaleString('ru-RU')
-      +' клеток ('+pr.pct+'%)'+(c.token?' · официальные цифры с сервера':' · оценка по выборке'));
+      +' клеток ('+pr.pct+'%)'
+      + (hasOfficial ? ' · официальные цифры с сервера'
+         : (c.token ? ' · токен не принят, нужен новый' : ' · оценка по выборке, пиксели без токена недоступны')));
   }catch(e){}
 
   try{
