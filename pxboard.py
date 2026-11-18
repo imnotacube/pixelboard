@@ -48,6 +48,9 @@ socket.getaddrinfo = _getaddrinfo
 TARGET = "https://pixel.mk69.dev"
 UA = ("Mozilla/5.0 (Linux; Android 14; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) "
       "Chrome/120.0.0.0 Mobile Safari/537.36")
+CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+PBKDF2_ITER = 240000
+PASS_FAILS = collections.deque(maxlen=20)
 CACHE_TTL = 2.0
 _lock = threading.Lock()
 _cache = {"t": 0.0, "payload": None}
@@ -113,6 +116,55 @@ TOKEN_META = {}
 TOK = {"state": "none", "code": None, "checked": 0, "me": None, "err": ""}
 TOK_LOCK = threading.Lock()
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def load_config():
+    try:
+        with open(CONFIG_PATH, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_config(cfg):
+    tmp = CONFIG_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, indent=1)
+    os.replace(tmp, CONFIG_PATH)
+    try:
+        os.chmod(CONFIG_PATH, 0o600)
+    except Exception:
+        pass
+
+
+def hash_pass(phrase, salt_hex, iterations=PBKDF2_ITER):
+    import hashlib
+    salt = bytes.fromhex(salt_hex)
+    return hashlib.pbkdf2_hmac("sha256", phrase.encode("utf-8"), salt, iterations).hex()
+
+
+def pass_configured():
+    cfg = load_config()
+    return bool(cfg.get("pass_hash") and cfg.get("pass_salt"))
+
+
+def pass_ok(candidate):
+    """сравнение с хешем из конфига; сама фраза никуда не пишется."""
+    import hmac
+    if not candidate:
+        return False
+    cfg = load_config()
+    if not (cfg.get("pass_hash") and cfg.get("pass_salt")):
+        return False
+    calc = hash_pass(candidate, cfg["pass_salt"], cfg.get("iterations", PBKDF2_ITER))
+    return hmac.compare_digest(calc, cfg["pass_hash"])
+
+
+def throttled():
+    now = time.time()
+    while PASS_FAILS and now - PASS_FAILS[0] > 300:
+        PASS_FAILS.popleft()
+    return len(PASS_FAILS) >= 5
 
 
 def token_path():
@@ -1372,13 +1424,20 @@ async function loadToken(){
 }
 
 $('tkSet').onclick = async () => {
+  const pass = prompt('парольная фраза');
+  if (!pass) return;
   const v = prompt('вставь initData целиком или готовый bearer');
   if (!v) return;
   const body = v.indexOf('query_id=') === 0 || v.indexOf('auth_date=') > 0
-    ? {initdata: v.trim()} : {token: v.trim()};
+    ? {pass: pass, initdata: v.trim()} : {pass: pass, token: v.trim()};
   const r = await fetch('/token', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
   const j = await r.json();
-  if (!j.ok) alert('не принято: ' + (j.err || j.code || 'ошибка'));
+  if (!j.ok){
+    const why = {bad_pass:'неверная фраза', pass_not_set:'фраза не задана: python pxboard.py --set-pass',
+                 too_many_tries:'слишком много попыток, подожди 5 минут',
+                 origin:'запрос не с localhost'}[j.err] || j.err || j.code;
+    alert('не принято: ' + why);
+  }
   setTimeout(loadToken, 800);
 };
 
@@ -1456,11 +1515,28 @@ class Handler(BaseHTTPRequestHandler):
         p = urllib.parse.urlparse(self.path)
         if p.path != "/token":
             return self._json({"ok": False, "err": "not_found"}, 404)
+
+        # csrf: посторонние сайты не должны уметь менять токен
+        origin = self.headers.get("Origin") or ""
+        if origin and "127.0.0.1" not in origin and "localhost" not in origin:
+            return self._json({"ok": False, "err": "origin"}, 403)
+
+        if not pass_configured():
+            return self._json({"ok": False, "err": "pass_not_set",
+                               "hint": "запусти: python pxboard.py --set-pass"}, 403)
+        if throttled():
+            return self._json({"ok": False, "err": "too_many_tries"}, 429)
+
         try:
             n = int(self.headers.get("Content-Length") or 0)
             body = json.loads(self.rfile.read(n) or b"{}")
         except Exception as e:
             return self._json({"ok": False, "err": type(e).__name__}, 400)
+
+        phrase = body.get("pass") or self.headers.get("X-Pass") or ""
+        if not pass_ok(phrase):
+            PASS_FAILS.append(time.time())
+            return self._json({"ok": False, "err": "bad_pass"}, 403)
 
         init = (body.get("initdata") or body.get("init_data") or "").strip()
         tok = (body.get("token") or "").strip()
@@ -1557,7 +1633,30 @@ def main():
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--token", default="", help="bearer из /api/auth, либо переменная окружения PX_TOKEN")
     ap.add_argument("--db", default=DB_PATH)
+    ap.add_argument("--set-pass", action="store_true", help="задать парольную фразу для смены токена")
     a = ap.parse_args()
+
+    if a.set_pass:
+        import getpass
+        import secrets
+        if sys.stdin.isatty():
+            p1 = getpass.getpass("парольная фраза: ")
+            p2 = getpass.getpass("ещё раз: ")
+        else:
+            lines = sys.stdin.read().splitlines()
+            p1 = lines[0].strip() if lines else ""
+            p2 = lines[1].strip() if len(lines) > 1 else ""
+        if not p1 or p1 != p2:
+            print("не совпало или пусто")
+            return 2
+        cfg = load_config()
+        cfg["pass_salt"] = secrets.token_hex(16)
+        cfg["iterations"] = PBKDF2_ITER
+        cfg["pass_hash"] = hash_pass(p1, cfg["pass_salt"], PBKDF2_ITER)
+        cfg.setdefault("port", a.port)
+        save_config(cfg)
+        print("фраза записана как pbkdf2-хеш в", CONFIG_PATH)
+        return 0
 
     here = os.path.dirname(os.path.abspath(__file__))
     TOKEN = a.token or os.environ.get("PX_TOKEN", "")
@@ -1568,9 +1667,10 @@ def main():
     DB_PATH = a.db
     threading.Thread(target=feed_loop, daemon=True).start()
     threading.Thread(target=token_loop, daemon=True).start()
-    print("pxboard: http://%s:%d/  db=%s  token=%s"
-          % (a.host, a.port, DB_PATH, "есть" if TOKEN else "нет"))
-    ThreadingHTTPServer((a.host, a.port), Handler).serve_forever()
+    print("pxboard: http://%s:%d/  db=%s  token=%s  pass=%s"
+          % (a.host, a.port, DB_PATH, "есть" if TOKEN else "нет",
+             "задан" if pass_configured() else "не задан"))
+    return ThreadingHTTPServer((a.host, a.port), Handler).serve_forever()
 
 
 if __name__ == "__main__":
