@@ -2,6 +2,7 @@ px.db
 px.db-wal
 px.db-shm
 token.txt
+token.json
 initdata.txt
 pxkeep.log
 pxkeep.err

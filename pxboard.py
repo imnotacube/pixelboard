@@ -46,6 +46,8 @@ def _getaddrinfo(host, port, *a, **kw):
 socket.getaddrinfo = _getaddrinfo
 
 TARGET = "https://pixel.mk69.dev"
+UA = ("Mozilla/5.0 (Linux; Android 14; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) "
+      "Chrome/120.0.0.0 Mobile Safari/537.36")
 CACHE_TTL = 2.0
 _lock = threading.Lock()
 _cache = {"t": 0.0, "payload": None}
@@ -91,8 +93,7 @@ def get_snapshot():
         "w": w, "h": h, "seg": seg, "ver": ver, "seq": seq,
         "palette": state.get("palette") or [],
         "online": state.get("online"), "phase": state.get("phase"),
-        "charges": state.get("max_charges"), "cooldown": state.get("cooldown_ms"),
-        "serverNow": state.get("now"), "bot": state.get("bot") or "",
+        "charges": state.get("max_charges"), "cooldown": state.get("cooldown_ms"),        "serverNow": state.get("now"), "bot": state.get("bot") or "",
         "serverStart": state.get("starts_at"), "serverEnd": state.get("ends_at"),
         "colors": base64.b64encode(colors).decode("ascii"),
         "painted": painted,
@@ -107,6 +108,109 @@ def get_snapshot():
 
 EVENTS = collections.deque(maxlen=4000)
 FEED = {"last_seq": 0, "seg": 0, "polled": 0, "err": ""}
+
+TOKEN_META = {}
+TOK = {"state": "none", "code": None, "checked": 0, "me": None, "err": ""}
+TOK_LOCK = threading.Lock()
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def token_path():
+    return os.path.join(BASE_DIR, "token.txt")
+
+
+def read_token_file():
+    try:
+        with open(token_path(), encoding="utf-8") as f:
+            return f.read().strip()
+    except FileNotFoundError:
+        return ""
+
+
+def read_meta_file():
+    try:
+        with open(os.path.join(BASE_DIR, "token.json"), encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_token(tok, expires=None, checking=True):
+    """записать токен и подхватить его без перезапуска сервера."""
+    global TOKEN, TOKEN_META
+    with TOK_LOCK:
+        TOKEN = tok
+        TOKEN_META = {"token": tok, "expires_at": expires, "updated": int(time.time() * 1000)}
+    with open(token_path(), "w", encoding="utf-8") as f:
+        f.write(tok)
+    with open(os.path.join(BASE_DIR, "token.json"), "w", encoding="utf-8") as f:
+        json.dump(TOKEN_META, f)
+    if checking:
+        TOK.update(state="checking", code=None, me=None, err="")
+
+
+def exchange_initdata(init):
+    data = json.dumps({"init_data": init}).encode("utf-8")
+    req = urllib.request.Request(TARGET + "/api/auth", data=data, method="POST")
+    req.add_header("Content-Type", "application/json")
+    req.add_header("Accept", "application/json")
+    req.add_header("User-Agent", UA)
+    req.add_header("Origin", TARGET)
+    req.add_header("Referer", TARGET + "/")
+    try:
+        with urllib.request.urlopen(req, timeout=25) as r:
+            j = json.loads(r.read())
+        return j.get("token", ""), j.get("expires_at"), None
+    except urllib.error.HTTPError as e:
+        try:
+            err = json.loads(e.read()).get("err", "http_%d" % e.code)
+        except Exception:
+            err = "http_%d" % e.code
+        return "", None, err
+    except Exception as e:
+        return "", None, type(e).__name__
+
+
+def check_token():
+    if not TOKEN:
+        TOK.update(state="none", code=None, checked=int(time.time() * 1000), me=None, err="")
+        return
+    try:
+        raw = fetch("/api/me", timeout=15)
+        TOK.update(state="ok", code=200, checked=int(time.time() * 1000),
+                   me=json.loads(raw), err="")
+    except urllib.error.HTTPError as e:
+        TOK.update(state="dead" if e.code == 401 else "error", code=e.code,
+                   checked=int(time.time() * 1000), me=None, err="")
+    except Exception as e:
+        TOK.update(state="net", code=None, checked=int(time.time() * 1000),
+                   me=TOK.get("me"), err=type(e).__name__)
+
+
+def token_loop():
+    """следит за token.txt и раз в минуту проверяет /api/me."""
+    global TOKEN, TOKEN_META
+    mtime = 0.0
+    last_check = 0.0
+    while True:
+        try:
+            st = os.stat(token_path())
+            if st.st_mtime != mtime:
+                mtime = st.st_mtime
+                from_file = read_token_file()
+                if from_file and from_file != TOKEN:
+                    with TOK_LOCK:
+                        TOKEN = from_file
+                        TOKEN_META = read_meta_file()
+                    TOK.update(state="checking", code=None, me=None, err="")
+                    last_check = 0.0
+        except FileNotFoundError:
+            mtime = 0.0
+
+        if time.time() - last_check >= 60 or TOK.get("state") == "checking":
+            check_token()
+            last_check = time.time()
+        time.sleep(5)
 
 
 def parse_segment(b):
@@ -324,6 +428,9 @@ tr.click{cursor:pointer}tr.click:hover td{background:#202020}
 .sw{height:13px;border-radius:2px;border:1px solid #0006}
 .q{display:inline-block;width:13px;height:13px;line-height:12px;text-align:center;border:1px solid #3a3a3a;border-radius:50%;color:#8a8a8a;font-size:9px;margin-left:5px;cursor:help;position:relative;font-style:normal;vertical-align:1px;user-select:none}
 .q:hover{border-color:var(--acc);color:var(--acc)}
+.src{display:inline-block;width:5px;height:5px;border-radius:50%;margin-left:6px;vertical-align:2px;cursor:help}
+.src.local{background:#5FB8FF}
+.src.sample{background:#FF7A1A}
 .q:hover::after{content:attr(data-tip);position:absolute;left:-8px;top:17px;width:252px;padding:7px 9px;background:#0c0c0c;border:1px solid var(--acc);border-radius:5px;color:#dcdcdc;font-size:11px;line-height:1.45;white-space:normal;text-align:left;z-index:999;box-shadow:0 8px 24px #000c;pointer-events:none}
 </style></head><body>
 <header>
@@ -332,6 +439,8 @@ tr.click{cursor:pointer}tr.click:hover td{background:#202020}
   <span class="badge" id="phase">—</span>
   <span class="badge" id="online">—</span>
   <span class="badge" id="timer">15s</span>
+  <span class="badge" title="считается локально по canvas.bin, в api этого поля нет"><i class="src local"></i> локально</span>
+  <span class="badge" title="оценка по выборке px.db, не всё поле"><i class="src sample"></i> выборка</span>
   <span id="err"></span>
 </header>
 <main>
@@ -363,6 +472,18 @@ tr.click{cursor:pointer}tr.click:hover td{background:#202020}
       <div class="row"><button id="btnAuto" class="on">авто 15s</button><button id="btnNow">сейчас</button></div>
       <div class="kv"><span>снимок</span><span id="snapAge">—</span></div>
       <div class="kv"><span>сервер</span><span id="srvTime">—</span></div>
+    </div>
+    <div class="panel">
+      <h2>Токен<button id="tkSet" style="padding:1px 6px;font-size:10px">заменить</button></h2>
+      <div class="kv"><span>состояние</span><span id="tkState">—</span></div>
+      <div class="kv"><span>истекает</span><span id="tkExp">—</span></div>
+      <div class="kv"><span>аккаунт</span><span id="tkAcc">—</span></div>
+      <div class="kv"><span>статус</span><span id="tkStatus">—</span></div>
+      <div class="kv"><span>клан и роль</span><span id="tkClan">—</span></div>
+      <div class="kv"><span>заряды</span><span id="tkCharges">—</span></div>
+      <div class="kv"><span>дневной лимит</span><span id="tkCap">—</span></div>
+      <div class="kv"><span>поставил сам</span><span id="tkPixels">—</span></div>
+      <div class="kv"><span>проверка</span><span id="tkChecked">—</span></div>
     </div>
     <div class="panel">
       <h2>Поле</h2>
@@ -474,6 +595,30 @@ const TIPS = {
 
 const TIP_KEYS = Object.keys(TIPS).sort((a,b)=>b.length-a.length);
 
+/* какие цифры считаются локально, а какие приходят прямо из api */
+const SRC_LOCAL = ["заполнено", "клетки", "цветов", "энтропия", "границы", "прирост",
+  "прогноз заполнения", "z-score окна", "новых событий", "изменено клеток",
+  "откатов цвета", "турбулентность", "рисунков", "крупнейший", "свободный блок",
+  "дублей тайлов", "кольца ц/с/к", "лента постановок"];
+const SRC_SAMPLE = ["авторы", "памятники", "возраст клеток"];
+
+function decorateSrc(){
+  for (const el of document.querySelectorAll('.kv > span:first-child, .panel h2')){
+    if (el.querySelector('.src')) continue;
+    const raw = el.textContent.trim().toLowerCase();
+    let kind = null;
+    if (SRC_SAMPLE.some(k => raw.startsWith(k))) kind = 'sample';
+    else if (SRC_LOCAL.some(k => raw.startsWith(k))) kind = 'local';
+    if (!kind) continue;
+    const i = document.createElement('i');
+    i.className = 'src ' + kind;
+    i.title = kind === 'local'
+      ? 'считается локально: поле из canvas.bin, в api такой цифры нет'
+      : 'по выборке px.db, покрывает не всё поле';
+    el.appendChild(i);
+  }
+}
+
 function decorate(){
   const nodes = document.querySelectorAll('.kv > span:first-child, th, .panel h2');
   for (const el of nodes){
@@ -488,6 +633,7 @@ function decorate(){
     if (el.tagName === 'H2' && el.childNodes.length > 1) el.insertBefore(i, el.childNodes[1]);
     else el.appendChild(i);
   }
+  decorateSrc();
 }
 
 /* ---------------- рисование поля ---------------- */
@@ -1115,6 +1261,56 @@ setInterval(()=>{
   setText('timer', Math.max(0,Math.ceil((S.nextAt-Date.now())/1000))+'s');
 }, 500);
 
+async function loadToken(){
+  try{
+    const t = await (await fetch('/token',{cache:'no-store'})).json();
+    const el = $('tkState');
+    const names = {ok:'жив', dead:'протух', none:'нет токена', net:'сеть недоступна', error:'ошибка'};
+    el.textContent = names[t.state] || t.state;
+    el.style.color = t.state === 'ok' ? 'var(--ok)' : (t.state === 'dead' ? 'var(--bad)' : 'var(--dim)');
+    if (t.code && t.state !== 'ok') el.textContent += ' (' + t.code + ')';
+
+    if (t.expires_at){
+      const ms = t.expires_at - Date.now();
+      const h = ms/3600000;
+      setText('tkExp', ms <= 0 ? 'истёк'
+        : h >= 24 ? (h/24).toFixed(1)+' сут'
+        : h >= 1 ? h.toFixed(1)+' ч'
+        : Math.max(1, Math.round(h*60))+' мин');
+    } else setText('tkExp', '—');
+
+    const me = t.me;
+    if (me){
+      setText('tkAcc', me.name + (me.username ? ' @'+me.username : '') + ' · ' + (me.pid||'').slice(0,8));
+      setText('tkStatus', (me.status||'—') + (me.number ? ' #'+me.number : '') + ' · ' + (me.tier||''));
+      setText('tkClan', me.clan ? me.clan.tag+' · '+me.clan.role : 'без клана');
+      setText('tkCharges', (me.max_charges!=null?me.max_charges:'—') + (me.slowed?' · замедлен':''));
+      setText('tkCap', (me.day_used!=null?me.day_used:'—') + ' / ' + (me.day_cap!=null?me.day_cap:'—'));
+      setText('tkPixels', (me.pixels!=null?me.pixels.toLocaleString('ru-RU'):'—'));
+    } else {
+      ['tkAcc','tkStatus','tkClan','tkCharges','tkCap','tkPixels'].forEach(id=>setText(id,'—'));
+    }
+    setText('tkChecked', t.checked ? new Date(t.checked).toLocaleTimeString('ru-RU',{hour12:false}) : '—');
+  }catch(e){
+    setText('tkState', 'нет ответа');
+    $('tkState').style.color = 'var(--warn)';
+  }
+}
+
+$('tkSet').onclick = async () => {
+  const v = prompt('вставь initData целиком или готовый bearer');
+  if (!v) return;
+  const body = v.indexOf('query_id=') === 0 || v.indexOf('auth_date=') > 0
+    ? {initdata: v.trim()} : {token: v.trim()};
+  const r = await fetch('/token', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+  const j = await r.json();
+  if (!j.ok) alert('не принято: ' + (j.err || j.code || 'ошибка'));
+  setTimeout(loadToken, 800);
+};
+
+loadToken();
+setInterval(loadToken, 30000);
+
 load();
 S.timer = setInterval(load, 15000);
 setInterval(pollFeed, 2000);
@@ -1143,6 +1339,39 @@ class Handler(BaseHTTPRequestHandler):
 
     def _json(self, obj, code=200):
         self._send(code, json.dumps(obj), "application/json")
+
+    def do_POST(self):
+        p = urllib.parse.urlparse(self.path)
+        if p.path != "/token":
+            return self._json({"ok": False, "err": "not_found"}, 404)
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+            body = json.loads(self.rfile.read(n) or b"{}")
+        except Exception as e:
+            return self._json({"ok": False, "err": type(e).__name__}, 400)
+
+        init = (body.get("initdata") or body.get("init_data") or "").strip()
+        tok = (body.get("token") or "").strip()
+
+        if init:
+            new, expires, err = exchange_initdata(init)
+            if not new:
+                return self._json({"ok": False, "err": err or "auth"}, 200)
+            save_token(new, expires)
+            return self._json({"ok": True, "state": "checking", "expires_at": expires})
+
+        if tok:
+            old_tok, old_meta = TOKEN, TOKEN_META
+            save_token(tok, None)
+            check_token()
+            if TOK.get("state") != "ok":
+                st, code = TOK.get("state"), TOK.get("code")
+                save_token(old_tok, old_meta.get("expires_at"), checking=False)
+                check_token()
+                return self._json({"ok": False, "err": st, "code": code}, 200)
+            return self._json({"ok": True, "state": "ok"})
+
+        return self._json({"ok": False, "err": "empty"}, 400)
 
     def do_GET(self):
         p = urllib.parse.urlparse(self.path)
@@ -1176,6 +1405,17 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(author_map())
             if p.path == "/progress":
                 return self._json(progress())
+            if p.path == "/token":
+                return self._json({
+                    "has_token": bool(TOKEN),
+                    "state": TOK.get("state") or "none",
+                    "code": TOK.get("code"),
+                    "checked": TOK.get("checked") or 0,
+                    "me": TOK.get("me"),
+                    "err": TOK.get("err") or "",
+                    "expires_at": TOKEN_META.get("expires_at"),
+                    "updated": TOKEN_META.get("updated"),
+                })
             if p.path == "/age":
                 return self._json(age_map())
             if p.path == "/monuments":
@@ -1195,16 +1435,23 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
-    global TOKEN, DB_PATH
+    global TOKEN, DB_PATH, TOKEN_META
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=8808)
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--token", default="", help="bearer из /api/auth, либо переменная окружения PX_TOKEN")
     ap.add_argument("--db", default=DB_PATH)
     a = ap.parse_args()
+
+    here = os.path.dirname(os.path.abspath(__file__))
     TOKEN = a.token or os.environ.get("PX_TOKEN", "")
+    if not TOKEN:
+        TOKEN = read_token_file()
+    TOKEN_META = read_meta_file()
+
     DB_PATH = a.db
     threading.Thread(target=feed_loop, daemon=True).start()
+    threading.Thread(target=token_loop, daemon=True).start()
     print("pxboard: http://%s:%d/  db=%s  token=%s"
           % (a.host, a.port, DB_PATH, "есть" if TOKEN else "нет"))
     ThreadingHTTPServer((a.host, a.port), Handler).serve_forever()

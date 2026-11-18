@@ -85,15 +85,15 @@ def auth(init):
     try:
         with urllib.request.urlopen(req, timeout=25) as r:
             j = json.loads(r.read())
-        return j.get("token", ""), None
+        return j.get("token", ""), j.get("expires_at"), None
     except urllib.error.HTTPError as e:
         try:
             err = json.loads(e.read()).get("err", "http_%d" % e.code)
         except Exception:
             err = "http_%d" % e.code
-        return "", err
+        return "", None, err
     except Exception as e:
-        return "", type(e).__name__
+        return "", None, type(e).__name__
 
 
 def alive(tok):
@@ -141,14 +141,17 @@ def main():
     while True:
         init = read_init()
         if init and (not token or not alive(token)):
-            new, err = auth(init)
+            new, expires, err = auth(init)
             if new:
                 token = new
                 atomic_write(os.path.join(HERE, "token.txt"), token)
+                atomic_write(os.path.join(HERE, "token.json"), json.dumps(
+                    {"token": token, "expires_at": expires, "updated": int(time.time() * 1000)}))
                 note("токен обновлён, %s…" % token[:6])
-                stop_board()
-                time.sleep(1)
-                start_board()
+                if child is None or child.poll() is not None:
+                    start_board()
+                else:
+                    note("pxboard подхватит токен сам, без перезапуска")
             elif err == "expired":
                 note("initdata протухла — положи новую строку в initdata.txt")
             else:
