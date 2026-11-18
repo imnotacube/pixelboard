@@ -285,15 +285,13 @@ def clan_stats():
     clans = [{"tag": r[0], "cells": r[1], "members": r[2], "last": r[3],
               "share": round(r[1] / area * 100, 2) if area else 0} for r in rows]
     if TOKEN:
-        try:
-            data = json.loads(fetch("/api/top"))
+        data = top_data()
+        if data.get("ok"):
             by_tag = {c.get("tag"): c for c in data.get("clans", []) if isinstance(c, dict)}
             for c in clans:
                 o = by_tag.get(c["tag"])
                 if o:
                     c["official"] = {k: o.get(k) for k in ("pixels", "members", "cells", "rank", "name")}
-        except Exception:
-            pass
     return {"attributed": attributed, "area": area, "clans": clans, "token": bool(TOKEN)}
 
 
@@ -371,6 +369,40 @@ def neighbours(limit=12):
 
 
 CLAN_HIST = collections.deque(maxlen=20)
+
+_CACHE = {"top": (0.0, None), "clans": (0.0, None)}
+
+
+def cached_fetch(kind, path, ttl):
+    """общий кеш для /api/top и /api/clans, чтобы не дёргать сервер лишний раз."""
+    ts, data = _CACHE.get(kind, (0.0, None))
+    if data is not None and time.time() - ts < ttl:
+        return data
+    if TOK.get("state") != "ok":
+        return data if data is not None else {"ok": False, "err": TOK.get("state") or "no_token"}
+    try:
+        payload = json.loads(fetch(path, timeout=20))
+        _CACHE[kind] = (time.time(), payload)
+        return payload
+    except urllib.error.HTTPError as e:
+        return {"ok": False, "err": "http_%d" % e.code}
+    except Exception as e:
+        return {"ok": False, "err": type(e).__name__}
+
+
+def top_data():
+    d = cached_fetch("top", "/api/top", 30)
+    if isinstance(d, dict) and "players" in d:
+        return {"ok": True, "players": d.get("players", []), "clans": d.get("clans", []),
+                "me": d.get("me"), "my_clan": d.get("my_clan"), "updated_at": d.get("updated_at")}
+    return {"ok": False, "err": (d or {}).get("err", "unknown") if isinstance(d, dict) else "unknown"}
+
+
+def clan_list():
+    d = cached_fetch("clans", "/api/clans", 60)
+    if isinstance(d, dict) and isinstance(d.get("clans"), list):
+        return {"ok": True, "clans": d["clans"]}
+    return {"ok": False, "err": (d or {}).get("err", "unknown") if isinstance(d, dict) else "unknown"}
 
 
 def clan_delta():
@@ -497,6 +529,7 @@ tr.click{cursor:pointer}tr.click:hover td{background:#202020}
       <div class="kv"><span>дневной лимит</span><span id="tkCap">—</span></div>
       <div class="kv"><span>поставил сам</span><span id="tkPixels">—</span></div>
       <div class="kv"><span>проверка</span><span id="tkChecked">—</span></div>
+      <div class="kv"><span>след. проверка</span><span id="tkNext">—</span></div>
     </div>
     <div class="panel">
       <h2>Поле</h2>
@@ -547,6 +580,11 @@ tr.click{cursor:pointer}tr.click:hover td{background:#202020}
       <table><thead><tr><th>клан</th><th class="num">пикселей</th><th class="num">на поле</th><th class="num">люди</th></tr></thead>
       <tbody id="clanBody"><tr><td colspan="4" style="color:var(--dim)">нет авторского слоя</td></tr></tbody></table>
       <div id="claninfo"></div>
+    </div>
+    <div class="panel">
+      <h2>Топ игроков</h2>
+      <table><thead><tr><th>#</th><th>имя</th><th class="num">пикселей</th><th class="num">клан</th></tr></thead>
+      <tbody id="topBody"><tr><td colspan="4" style="color:var(--dim)">нужен рабочий токен</td></tr></tbody></table>
     </div>
     <div class="panel">
       <h2>Авторы</h2>
@@ -1119,6 +1157,10 @@ async function loadDerived(){
           +'<td class="num">'+px+'</td>'
           +'<td class="num">'+(o?'':'≈')+field.toLocaleString('ru-RU')+'</td>'
           +'<td class="num">'+(o&&o.members!=null?o.members:k.members)+'</td>';
+        const info = S.clanInfo && S.clanInfo[k.tag];
+        if (info) tr.title = (info.name || k.tag)
+          + (info.owner ? ' · владелец ' + info.owner.name : '')
+          + (info.description ? '\n' + info.description : '');
         tr.onclick=()=>showClan(k.tag);
         body.appendChild(tr);
       }
@@ -1319,6 +1361,10 @@ async function loadToken(){
       ['tkAcc','tkStatus','tkClan','tkCharges','tkCap','tkPixels'].forEach(id=>setText(id,'—'));
     }
     setText('tkChecked', t.checked ? new Date(t.checked).toLocaleTimeString('ru-RU',{hour12:false}) : '—');
+    if (t.checked){
+      const left = Math.max(0, 60 - Math.round((Date.now() - t.checked)/1000));
+      setText('tkNext', left + ' с');
+    } else setText('tkNext', '—');
   }catch(e){
     setText('tkState', 'нет ответа');
     $('tkState').style.color = 'var(--warn)';
@@ -1335,6 +1381,44 @@ $('tkSet').onclick = async () => {
   if (!j.ok) alert('не принято: ' + (j.err || j.code || 'ошибка'));
   setTimeout(loadToken, 800);
 };
+
+async function loadTop(){
+  try{
+    const t = await (await fetch('/top',{cache:'no-store'})).json();
+    const body = $('topBody');
+    if (!t.ok){
+      body.innerHTML = '<tr><td colspan="4" style="color:var(--dim)">нет данных: '+ (t.err||'токен') +'</td></tr>';
+      return;
+    }
+    body.innerHTML = '';
+    const me = (t.me && t.me.rank) ? t.me : null;
+    for (const p of t.players.slice(0,15)){
+      const tr = document.createElement('tr');
+      const mine = me && p.rank === me.rank;
+      tr.innerHTML = '<td style="color:var(--dim)">'+p.rank+'</td>'
+        + '<td style="color:'+hsl(p.pid||p.name)+'">'+p.name+(mine?' ←':'')+'</td>'
+        + '<td class="num">'+p.pixels.toLocaleString('ru-RU')+'</td>'
+        + '<td class="num" style="color:var(--dim)">'+(p.clan_tag||'—')+'</td>';
+      body.appendChild(tr);
+    }
+  }catch(e){
+    $('topBody').innerHTML = '<tr><td colspan="4" style="color:var(--dim)">ошибка: '+e.message+'</td></tr>';
+  }
+}
+
+async function loadClanList(){
+  try{
+    const t = await (await fetch('/clanlist',{cache:'no-store'})).json();
+    if (!t.ok) return;
+    S.clanInfo = {};
+    for (const c of t.clans) S.clanInfo[c.tag] = c;
+  }catch(e){}
+}
+
+loadTop();
+loadClanList();
+setInterval(loadTop, 60000);
+setInterval(loadClanList, 120000);
 
 loadToken();
 setInterval(loadToken, 30000);
@@ -1431,6 +1515,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(clan_map())
             if p.path == "/authors":
                 return self._json(author_map())
+            if p.path == "/top":
+                return self._json(top_data())
+            if p.path == "/clanlist":
+                return self._json(clan_list())
             if p.path == "/progress":
                 return self._json(progress())
             if p.path == "/token":
