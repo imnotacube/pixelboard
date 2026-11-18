@@ -358,7 +358,7 @@ def cached_fetch(kind, path, ttl):
 
 
 def top_data():
-    d = cached_fetch("top", "/api/top", 30)
+    d = cached_fetch("top", "/api/top", 14)
     if isinstance(d, dict) and "players" in d:
         return {"ok": True, "players": d.get("players", []), "clans": d.get("clans", []),
                 "me": d.get("me"), "my_clan": d.get("my_clan"), "updated_at": d.get("updated_at")}
@@ -419,6 +419,10 @@ tr.click{cursor:pointer}tr.click:hover td{background:#202020}
 #cellinfo,#claninfo,#feed{color:var(--dim);font-size:11.5px}
 #feed div{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 #feed b{color:var(--fg)}
+#feed a.fx{color:var(--acc);text-decoration:none;border-bottom:1px dotted #2f6f9f}
+#feed a.fx:hover{border-bottom-color:var(--acc)}
+#feed .who{color:var(--dim)}
+#feed .dot{display:inline-block;width:8px;height:8px;border-radius:2px;vertical-align:0;margin:0 4px}
 #toasts{position:fixed;right:14px;bottom:14px;display:flex;flex-direction:column;gap:6px;z-index:50}
 .toast{background:#241a10;border:1px solid #6b4226;color:#ffd9a8;padding:6px 10px;border-radius:5px;font-size:11.5px;max-width:320px}
 #err{color:var(--warn)}
@@ -1097,11 +1101,43 @@ async function pollFeed(){
 }
 
 function renderFeed(){
-  $('feed').innerHTML = S.feed.slice(0,14).map(e=>
-    '<div>'+(e.sec?new Date(e.sec*1000).toLocaleTimeString('ru-RU',{hour12:false}):'')
-    +' <b>('+e.x+','+e.y+')</b> c'+e.c+' <span style="color:'+S.pal[e.c]+'">■</span></div>'
-  ).join('');
+  $('feed').innerHTML = S.feed.slice(0,14).map((e,i)=>{
+    const t = e.sec ? new Date(e.sec*1000).toLocaleTimeString('ru-RU',{hour12:false}) : '';
+    const who = e.who
+      ? ' <span class="who">· <b style="color:'+hsl(e.who.pid||e.who.name)+'">'+e.who.name+'</b>'
+        + (e.who.clan_tag ? ' ['+e.who.clan_tag+']' : '') + '</span>'
+      : '';
+    return '<div>'+t+' <a href="#" class="fx" data-i="'+i+'">('+e.x+','+e.y+')</a>'
+      + '<span class="dot" style="background:'+(S.pal[e.c]||'#666')+'"></span>c'+e.c + who + '</div>';
+  }).join('');
 }
+
+$('feed').addEventListener('click', async ev => {
+  const a = ev.target.closest('a.fx');
+  if (!a) return;
+  ev.preventDefault();
+  const e = S.feed[Number(a.dataset.i)];
+  if (!e) return;
+  S.picked = {x: e.x, y: e.y};
+  if (e.who){ renderFeed(); return; }
+  a.textContent = '('+e.x+','+e.y+') …';
+  try{
+    const j = await (await fetch('/cell?x='+e.x+'&y='+e.y,{cache:'no-store'})).json();
+    e.who = j.by || {name:'никто не ставил', pid:'', clan_tag:null};
+    renderFeed();
+    const info = $('cellinfo');
+    if (j.by){
+      const t = j.ts ? new Date(j.ts).toLocaleString('ru-RU',{hour12:false}) : '—';
+      info.innerHTML = '<b>('+e.x+','+e.y+')</b> · color '+j.color+' · <b style="color:'+hsl(j.by.pid)+'">'
+        + j.by.name + '</b>' + (j.by.clan_tag?' ['+j.by.clan_tag+']':'') + ' · pid '+j.by.pid + '<br>' + t;
+    } else {
+      info.innerHTML = '<b>('+e.x+','+e.y+')</b> — никто не ставил';
+    }
+  }catch(err){
+    a.textContent = '('+e.x+','+e.y+')';
+    $('cellinfo').textContent = 'ошибка: ' + err.message;
+  }
+});
 
 /* ---------------- клик по клетке ---------------- */
 $('field').addEventListener('click', async ev => {
@@ -1268,7 +1304,7 @@ async function loadClanList(){
 
 loadTop();
 loadClanList();
-setInterval(loadTop, 60000);
+setInterval(loadTop, 15000);
 setInterval(loadClanList, 120000);
 
 loadToken();
