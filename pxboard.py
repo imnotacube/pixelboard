@@ -303,6 +303,9 @@ tr.click{cursor:pointer}tr.click:hover td{background:#202020}
 #err{color:var(--warn)}
 .swatches{display:grid;grid-template-columns:repeat(16,1fr);gap:3px}
 .sw{height:13px;border-radius:2px;border:1px solid #0006}
+.q{display:inline-block;width:13px;height:13px;line-height:12px;text-align:center;border:1px solid #3a3a3a;border-radius:50%;color:#8a8a8a;font-size:9px;margin-left:5px;cursor:help;position:relative;font-style:normal;vertical-align:1px;user-select:none}
+.q:hover{border-color:var(--acc);color:var(--acc)}
+.q:hover::after{content:attr(data-tip);position:absolute;left:-8px;top:17px;width:252px;padding:7px 9px;background:#0c0c0c;border:1px solid var(--acc);border-radius:5px;color:#dcdcdc;font-size:11px;line-height:1.45;white-space:normal;text-align:left;z-index:999;box-shadow:0 8px 24px #000c;pointer-events:none}
 </style></head><body>
 <header>
   <h1>PIXELBOARD</h1>
@@ -437,6 +440,62 @@ function rgb(hex){ const n = parseInt(hex.slice(1),16); return [n>>16&255,n>>8&2
 function hue(seed){ let h=0; for (let i=0;i<seed.length;i++) h=(h*31+seed.charCodeAt(i))%360; return h; }
 function hsl(seed, s=68, l=55){ return `hsl(${hue(seed)} ${s}% ${l}%)`; }
 function hslToRgb(h,s,l){ const f=n=>{const k=(n+h*12)%12; const a=s*Math.min(l,1-l); return l-a*Math.max(-1,Math.min(k-3,9-k,1));}; return [f(0),f(8),f(4)].map(v=>Math.round(v*255)); }
+
+/* ---------------- подсказки ---------------- */
+const TIPS = {
+  "заполнено": "доля закрашенных клеток поля. берётся из canvas.bin: 262144 байта, 0 = пусто.",
+  "клетки": "закрашено / всего клеток. каждая клетка — один индекс палитры.",
+  "цветов": "сколько индексов палитры реально стоит на поле из 32 доступных.",
+  "энтропия": "неопределённость по цветам: сумма −p·log2(p). чем выше, тем пестрее поле.",
+  "границы": "число соседних пар клеток разного цвета. мера детализации рисунка.",
+  "событий": "всего постановок с начала ивента, поле seq из шапки снапшота.",
+  "прирост": "клеток в минуту: разница заполнения двух снапшотов, делённая на интервал.",
+  "прогноз заполнения": "сколько часов до заполнения поля при текущем приросте. остаток / прирост.",
+  "z-score окна": "насколько текущее окно выбивается из прошлых в сигмах. выше 3 — всплеск.",
+  "новых событий": "разница seq между этим и предыдущим снапшотом.",
+  "изменено клеток": "побайтовое сравнение двух снапшотов: сколько клеток сменило цвет.",
+  "откатов цвета": "клетка вернулась к цвету двух окон назад: стёрли и восстановили.",
+  "турбулентность": "изменённые клетки в процентах от всего поля за окно.",
+  "рисунков": "связные однотонные области от 16 клеток. каждая — отдельный рисунок.",
+  "крупнейший": "самая большая однотонная область: площадь и левый верхний угол.",
+  "свободный блок": "максимальный пустой прямоугольник: ширина×высота и координаты.",
+  "дублей тайлов": "блоки 16×16 с одинаковым хешем цвета: копии одного изображения.",
+  "кольца ц/с/к": "заполнение в центре, средней зоне и по краям поля в процентах.",
+  "снимок": "когда сервер забрал canvas.bin с сайта.",
+  "сервер": "время по часам самого сайта, не локальное.",
+  "на поле": "клетки, которые клан держит по счёту сервера из /api/top.",
+  "покрытие": "те же клетки в процентах от 262 144.",
+  "пикселей": "постановки клана по счёту сервера, включая перекраски.",
+  "люди": "участников в клане по данным сервера.",
+  "клан": "клик по строке — топ участников из локальной базы.",
+  "авторы": "разбивка по авторам из px.db: сколько клеток сейчас за каждым.",
+  "памятники": "старейшие клетки поля: кто поставил первым и что уцелело.",
+  "возраст клеток": "сколько прошло с последней постановки в клетку, по корзинам.",
+  "интервалы постановок": "сколько пикселей ставили в секунду. ровные числа — скрипт, разброс — люди.",
+  "палитра": "площадь каждого цвета. наведи на плашку — увидишь точное число.",
+  "лента постановок": "живой поток из /live/head.bin: секунда, координаты, цвет.",
+  "дельты": "клетки, сменившие цвет за последнее окно.",
+  "тайлы": "блоки 16×16: яркость = доля закрашенного.",
+  "горячие": "накопительная карта: где чаще всего перекрашивают.",
+};
+
+const TIP_KEYS = Object.keys(TIPS).sort((a,b)=>b.length-a.length);
+
+function decorate(){
+  const nodes = document.querySelectorAll('.kv > span:first-child, th, .panel h2');
+  for (const el of nodes){
+    if (el.querySelector('.q')) continue;
+    const raw = el.textContent.trim().toLowerCase();
+    const key = TIP_KEYS.find(k => raw === k || raw.startsWith(k));
+    if (!key) continue;
+    const i = document.createElement('i');
+    i.className = 'q';
+    i.dataset.tip = TIPS[key];
+    i.textContent = '?';
+    if (el.tagName === 'H2' && el.childNodes.length > 1) el.insertBefore(i, el.childNodes[1]);
+    else el.appendChild(i);
+  }
+}
 
 /* ---------------- рисование поля ---------------- */
 function paint(colors){
@@ -829,6 +888,7 @@ async function load(){
 
     S.last=j; S.nextAt=Date.now()+15000;
     $('conn').textContent='live'; $('conn').className='badge ok'; setText('err','');
+    decorate();
     loadDerived();
   }catch(e){
     $('conn').textContent='offline'; $('conn').className='badge bad'; setText('err', e.message);
@@ -901,9 +961,7 @@ async function loadDerived(){
   }catch(e){}
 
   try{ await loadClanMap(); }catch(e){}
-  try{
-    if (!S.clanNames.length) {} 
-  }catch(e){}
+  decorate();
 }
 
 function b64(s){
