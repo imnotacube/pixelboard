@@ -1,0 +1,10 @@
+px.db
+px.db-wal
+px.db-shm
+token.txt
+hits.jsonl
+field.jsonl
+snap.json
+canvas.bin
+__pycache__/
+*.pyc

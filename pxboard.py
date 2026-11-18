@@ -1,0 +1,1123 @@
+#!/usr/bin/env python3
+"""pxboard — дашборд pixel.mk69.dev: поле, дельты, кланы, авторы, возраст, поток.
+
+  python pxboard.py                 # http://127.0.0.1:8808/
+  python pxboard.py --token <T>     # + официальные цифры кланов из /api/top
+  python pxboard.py --db px.db      # авторский слой
+
+Сервер тянет /live/canvas.bin, /api/state, опрашивает /live/head.bin раз в секунду,
+читает px.db. Всё остальное — статистика — считается в браузере.
+"""
+
+import argparse
+import base64
+import collections
+import io
+import json
+import os
+import sqlite3
+import sys
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+if hasattr(sys.stdout, "buffer"):
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+
+TARGET = "https://pixel.mk69.dev"
+CACHE_TTL = 2.0
+_lock = threading.Lock()
+_cache = {"t": 0.0, "payload": None}
+DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "px.db")
+TOKEN = ""
+
+# ---------------------------------------------------------------- внешние данные
+
+
+def fetch(path, timeout=20):
+    req = urllib.request.Request(TARGET + path, headers={
+        "User-Agent": "Mozilla/5.0 (Linux; Android 14; Pixel 7) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
+        "Accept": "application/json",
+        "Origin": TARGET,
+        "Referer": TARGET + "/",
+    })
+    if TOKEN:
+        req.add_header("Authorization", "Bearer " + TOKEN)
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.read()
+
+
+def get_snapshot():
+    with _lock:
+        if _cache["payload"] and time.time() - _cache["t"] < CACHE_TTL:
+            return _cache["payload"]
+    raw = fetch("/live/canvas.bin")
+    if len(raw) < 24 or raw[:4] != b"PXC1":
+        raise ValueError("bad snapshot")
+    seg = int.from_bytes(raw[4:8], "little")
+    ver = int.from_bytes(raw[8:12], "little")
+    w = int.from_bytes(raw[12:14], "little")
+    h = int.from_bytes(raw[14:16], "little")
+    seq = int.from_bytes(raw[16:24], "little")
+    colors = raw[24:24 + w * h]
+    painted = sum(1 for b in colors if b)
+    try:
+        state = json.loads(fetch("/api/state", timeout=12))
+    except Exception:
+        state = {}
+    payload = {
+        "w": w, "h": h, "seg": seg, "ver": ver, "seq": seq,
+        "palette": state.get("palette") or [],
+        "online": state.get("online"), "phase": state.get("phase"),
+        "charges": state.get("max_charges"), "cooldown": state.get("cooldown_ms"),
+        "serverNow": state.get("now"), "bot": state.get("bot") or "",
+        "serverStart": state.get("starts_at"), "serverEnd": state.get("ends_at"),
+        "colors": base64.b64encode(colors).decode("ascii"),
+        "painted": painted,
+        "fetchedAt": int(time.time() * 1000),
+    }
+    with _lock:
+        _cache.update(t=time.time(), payload=payload)
+    return payload
+
+
+# ---------------------------------------------------------------- поток событий
+
+EVENTS = collections.deque(maxlen=4000)
+FEED = {"last_seq": 0, "seg": 0, "polled": 0, "err": ""}
+
+
+def parse_segment(b):
+    if not b or len(b) < 40 or b[:4] != b"PXS1":
+        return None
+    n = int.from_bytes(b[4:8], "little")
+    first = int.from_bytes(b[16:24], "little")
+    last = int.from_bytes(b[24:32], "little")
+    flags = b[32]
+    count = int.from_bytes(b[36:40], "little")
+    if len(b) != 40 + count * 5:
+        return None
+    ents = [(int.from_bytes(b[40 + i * 5:42 + i * 5], "little"),
+             int.from_bytes(b[42 + i * 5:44 + i * 5], "little"),
+             b[44 + i * 5]) for i in range(count)]
+    return {"n": n, "first": first, "last": last, "flags": flags,
+            "count": count, "entries": ents}
+
+
+def feed_loop():
+    floor = None
+    while True:
+        try:
+            seg = parse_segment(fetch("/live/head.bin", timeout=12))
+            if seg:
+                if floor is None:
+                    floor = seg["last"]
+                if seg["count"]:
+                    for i, (x, y, c) in enumerate(seg["entries"]):
+                        seq = seg["first"] + i
+                        if seq > floor:
+                            EVENTS.append({"seq": seq, "sec": seg["n"], "x": x, "y": y, "c": c})
+                    floor = max(floor, seg["last"])
+                FEED.update(seg=seg["n"], last_seq=seg["last"], polled=int(time.time() * 1000), err="")
+        except Exception as e:
+            FEED["err"] = str(e)[:120]
+        time.sleep(1.0)
+
+
+# ---------------------------------------------------------------- база авторов
+
+
+def db_rows(sql, args=()):
+    if not os.path.exists(DB_PATH):
+        return []
+    c = sqlite3.connect(DB_PATH, timeout=10)
+    try:
+        return c.execute(sql, args).fetchall()
+    except sqlite3.Error:
+        return []
+    finally:
+        c.close()
+
+
+def clan_stats():
+    rows = db_rows("""SELECT clan, COUNT(*) n, COUNT(DISTINCT pid) m, MAX(ts) last
+                      FROM cells WHERE clan IS NOT NULL AND clan <> ''
+                      GROUP BY clan ORDER BY n DESC""")
+    attributed = db_rows("SELECT COUNT(*) FROM cells WHERE pid IS NOT NULL")
+    attributed = attributed[0][0] if attributed else 0
+    area = sum(r[1] for r in rows) or 0
+    clans = [{"tag": r[0], "cells": r[1], "members": r[2], "last": r[3],
+              "share": round(r[1] / area * 100, 2) if area else 0} for r in rows]
+    if TOKEN:
+        try:
+            data = json.loads(fetch("/api/top"))
+            by_tag = {c.get("tag"): c for c in data.get("clans", []) if isinstance(c, dict)}
+            for c in clans:
+                o = by_tag.get(c["tag"])
+                if o:
+                    c["official"] = {k: o.get(k) for k in ("pixels", "members", "cells", "rank", "name")}
+        except Exception:
+            pass
+    return {"attributed": attributed, "area": area, "clans": clans, "token": bool(TOKEN)}
+
+
+def clan_pixels(tag, limit=12):
+    return db_rows("""SELECT name, pid, COUNT(*) n, MIN(ts) first, MAX(ts) last
+                      FROM cells WHERE clan = ? AND pid IS NOT NULL
+                      GROUP BY pid ORDER BY n DESC LIMIT ?""", (tag, limit))
+
+
+def progress():
+    done = db_rows("SELECT COUNT(*) FROM cells WHERE pid IS NOT NULL")
+    done = done[0][0] if done else 0
+    try:
+        painted = get_snapshot().get("painted") or 0
+    except Exception:
+        painted = 0
+    return {"done": done, "target": painted,
+            "pct": round(done / painted * 100, 2) if painted else 0}
+
+
+def clan_map():
+    rows = db_rows("SELECT DISTINCT clan FROM cells WHERE clan IS NOT NULL AND clan <> '' ORDER BY clan")
+    names = [r[0] for r in rows][:255]
+    index = {n: i + 1 for i, n in enumerate(names)}
+    grid = bytearray(512 * 512)
+    for idx, clan in db_rows("SELECT idx, clan FROM cells WHERE clan IS NOT NULL AND clan <> ''"):
+        i = index.get(clan)
+        if i:
+            grid[idx] = i
+    return {"names": names, "map": base64.b64encode(bytes(grid)).decode("ascii")}
+
+
+def author_map():
+    rows = db_rows("""SELECT pid, name, COUNT(*) n FROM cells
+                      WHERE pid IS NOT NULL GROUP BY pid ORDER BY n DESC LIMIT 254""")
+    names = [{"pid": r[0], "name": r[1], "cells": r[2]} for r in rows]
+    index = {r[0]: i + 1 for i, r in enumerate(rows)}
+    grid = bytearray(512 * 512)
+    for idx, pid in db_rows("SELECT idx, pid FROM cells WHERE pid IS NOT NULL"):
+        i = index.get(pid)
+        if i:
+            grid[idx] = i
+    return {"authors": names, "map": base64.b64encode(bytes(grid)).decode("ascii")}
+
+
+def age_map():
+    now = int(time.time() * 1000)
+    grid = bytearray(512 * 512)
+    hist = [0] * 8
+    buckets = [1, 3, 6, 12, 24, 48, 96, 10 ** 9]
+    for idx, ts in db_rows("SELECT idx, ts FROM cells WHERE ts IS NOT NULL AND pid IS NOT NULL"):
+        hours = max(0.0, (now - ts) / 3600000.0)
+        k = 0
+        while k < 7 and hours >= buckets[k]:
+            k += 1
+        hist[k] += 1
+        grid[idx] = k + 1
+    return {"map": base64.b64encode(bytes(grid)).decode("ascii"),
+            "hist": hist, "buckets": ["<1ч", "1-3ч", "3-6ч", "6-12ч", "12-24ч", "1-2д", "2-4д", "4д+"]}
+
+
+def monuments(limit=10):
+    rows = db_rows("""SELECT x, y, ts, pid, name, clan FROM cells
+                      WHERE ts IS NOT NULL AND pid IS NOT NULL ORDER BY ts ASC LIMIT ?""", (limit,))
+    return [{"x": r[0], "y": r[1], "ts": r[2], "pid": r[3], "name": r[4], "clan": r[5]} for r in rows]
+
+
+def neighbours(limit=12):
+    rows = db_rows("""SELECT a.clan, b.clan, COUNT(*) n FROM cells a JOIN cells b
+                      ON b.idx = a.idx + 1
+                      WHERE a.clan IS NOT NULL AND b.clan IS NOT NULL
+                        AND a.clan <> '' AND b.clan <> '' AND a.clan <> b.clan
+                      GROUP BY a.clan, b.clan ORDER BY n DESC LIMIT ?""", (limit,))
+    return [{"a": r[0], "b": r[1], "n": r[2]} for r in rows]
+
+
+CLAN_HIST = collections.deque(maxlen=20)
+
+
+def clan_delta():
+    cur = {r[0]: r[1] for r in db_rows(
+        "SELECT clan, COUNT(*) FROM cells WHERE clan IS NOT NULL AND clan <> '' GROUP BY clan")}
+    prev = CLAN_HIST[-1] if CLAN_HIST else {}
+    CLAN_HIST.append(cur)
+    out = []
+    for tag, n in cur.items():
+        out.append({"tag": tag, "cells": n, "delta": n - prev.get(tag, n)})
+    return sorted(out, key=lambda c: -c["cells"])
+
+
+# ---------------------------------------------------------------- HTML
+
+HTML = r"""<!doctype html>
+<html lang="ru"><head><meta charset="utf-8">
+<title>pxboard — pixel.mk69.dev</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+:root{--bg:#111;--panel:#1a1a1a;--line:#2a2a2a;--fg:#e9e9e9;--dim:#8a8a8a;--acc:#5FB8FF;--warn:#FF7A1A;--bad:#F0353B;--ok:#86E04C}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:12.5px/1.45 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+header{display:flex;align-items:center;gap:12px;padding:9px 14px;border-bottom:1px solid var(--line);background:#181818;position:sticky;top:0;z-index:5}
+h1{font-size:12px;font-weight:600;margin:0;letter-spacing:.06em}
+.badge{padding:2px 7px;border:1px solid var(--line);border-radius:4px;color:var(--dim);white-space:nowrap}
+.badge.ok{color:var(--ok);border-color:#2E6B1E}
+.badge.bad{color:var(--bad);border-color:#5C0F1F}
+.badge.wait{color:var(--warn);border-color:#6b4226}
+main{display:grid;grid-template-columns:minmax(340px,1fr) 430px;gap:12px;padding:12px;align-items:start}
+@media(max-width:1060px){main{grid-template-columns:1fr}}
+.stage{position:relative;background:#0b0b0b;border:1px solid var(--line);border-radius:6px;overflow:hidden;touch-action:none}
+canvas#field{display:block;width:100%;height:auto;image-rendering:pixelated;cursor:crosshair}
+canvas#overlay{position:absolute;inset:0;width:100%;height:100%;image-rendering:pixelated;pointer-events:none;opacity:.88}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:9px 11px;margin-bottom:10px}
+.panel h2{font-size:10px;letter-spacing:.09em;text-transform:uppercase;color:var(--dim);margin:0 0 7px;display:flex;justify-content:space-between}
+.kv{display:flex;justify-content:space-between;gap:8px;padding:1.5px 0}
+.kv span:first-child{color:var(--dim)}
+.bar{height:5px;background:#000;border-radius:3px;overflow:hidden;margin-top:4px}
+.bar i{display:block;height:100%;background:linear-gradient(90deg,#2B74E0,#5FB8FF)}
+.row{display:flex;gap:6px;flex-wrap:wrap}
+button{background:#232323;color:var(--fg);border:1px solid var(--line);border-radius:4px;padding:3px 8px;font:inherit;cursor:pointer}
+button.on{border-color:var(--acc);color:var(--acc)}
+button:hover{border-color:#4a4a4a}
+table{width:100%;border-collapse:collapse;font-size:11.5px}
+th{text-align:left;color:var(--dim);font-weight:400;font-size:9.5px;letter-spacing:.06em;text-transform:uppercase;padding:0 4px 3px 0}
+td{padding:2.5px 4px 2.5px 0;border-top:1px solid #232323}
+td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
+tr.click{cursor:pointer}tr.click:hover td{background:#202020}
+.mini{height:4px;border-radius:2px;background:#2B74E0}
+.legend{display:flex;flex-wrap:wrap;gap:6px;margin-top:6px;font-size:10.5px;color:var(--dim)}
+.legend i{display:inline-block;width:8px;height:8px;border-radius:2px;margin-right:3px}
+#spark{width:100%;height:40px;display:block}
+#stack{width:100%;height:34px;display:block}
+#ivals{width:100%;height:34px;display:block}
+#minimap{width:132px;height:132px;image-rendering:pixelated;border:1px solid var(--line);border-radius:4px;display:block;float:right}
+#cellinfo,#claninfo,#feed{color:var(--dim);font-size:11.5px}
+#feed div{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#feed b{color:var(--fg)}
+#toasts{position:fixed;right:14px;bottom:14px;display:flex;flex-direction:column;gap:6px;z-index:50}
+.toast{background:#241a10;border:1px solid #6b4226;color:#ffd9a8;padding:6px 10px;border-radius:5px;font-size:11.5px;max-width:320px}
+#err{color:var(--warn)}
+.swatches{display:grid;grid-template-columns:repeat(16,1fr);gap:3px}
+.sw{height:13px;border-radius:2px;border:1px solid #0006}
+</style></head><body>
+<header>
+  <h1>PIXELBOARD</h1>
+  <span class="badge" id="conn">connecting</span>
+  <span class="badge" id="phase">—</span>
+  <span class="badge" id="online">—</span>
+  <span class="badge" id="timer">15s</span>
+  <span id="err"></span>
+</header>
+<main>
+  <div>
+    <div class="stage" id="stage">
+      <canvas id="field" width="512" height="512"></canvas>
+      <canvas id="overlay" width="512" height="512"></canvas>
+    </div>
+    <div class="panel" style="margin-top:10px">
+      <h2>Вид</h2>
+      <div class="row">
+        <button id="zIn">+</button><button id="zOut">−</button><button id="zReset">сброс</button>
+        <button id="expPng">PNG</button><button id="expCsv">CSV</button>
+        <button id="deep">открыть клетку в Telegram</button>
+      </div>
+      <div style="margin-top:8px;overflow:hidden">
+        <canvas id="minimap" width="64" height="64"></canvas>
+        <div id="cellinfo" style="min-height:40px">клик по полю — автор, время, клан</div>
+      </div>
+    </div>
+    <div class="panel">
+      <h2>Лента постановок <span id="feedState" style="color:var(--dim)"></span></h2>
+      <div id="feed"></div>
+    </div>
+  </div>
+  <div>
+    <div class="panel">
+      <h2>Обновление</h2>
+      <div class="row"><button id="btnAuto" class="on">авто 15s</button><button id="btnNow">сейчас</button></div>
+      <div class="kv"><span>снимок</span><span id="snapAge">—</span></div>
+      <div class="kv"><span>сервер</span><span id="srvTime">—</span></div>
+    </div>
+    <div class="panel">
+      <h2>Поле</h2>
+      <div class="kv"><span>заполнено</span><span id="fill">—</span></div>
+      <div class="bar"><i id="fillBar" style="width:0"></i></div>
+      <div class="kv" style="margin-top:6px"><span>клетки</span><span id="cells">—</span></div>
+      <div class="kv"><span>цветов</span><span id="ncolors">—</span></div>
+      <div class="kv"><span>энтропия</span><span id="entropy">—</span></div>
+      <div class="kv"><span>границы</span><span id="edges">—</span></div>
+      <div class="kv"><span>событий</span><span id="seq">—</span></div>
+      <div class="kv"><span>прирост</span><span id="rate">—</span></div>
+      <div class="kv"><span>прогноз заполнения</span><span id="eta">—</span></div>
+      <div class="kv"><span>z-score окна</span><span id="zscore">—</span></div>
+    </div>
+    <div class="panel">
+      <h2>За окно</h2>
+      <div class="kv"><span>новых событий</span><span id="winEv">—</span></div>
+      <div class="kv"><span>изменено клеток</span><span id="winCells">—</span></div>
+      <div class="kv"><span>откатов цвета</span><span id="reverts">—</span></div>
+      <div class="kv"><span>турбулентность</span><span id="turb">—</span></div>
+      <canvas id="spark" width="640" height="80"></canvas>
+      <canvas id="stack" width="640" height="68"></canvas>
+    </div>
+    <div class="panel">
+      <h2>Структура</h2>
+      <div class="kv"><span>рисунков</span><span id="regions">—</span></div>
+      <div class="kv"><span>крупнейший</span><span id="biggest">—</span></div>
+      <div class="kv"><span>свободный блок</span><span id="free">—</span></div>
+      <div class="kv"><span>дублей тайлов</span><span id="dups">—</span></div>
+      <div class="kv"><span>кольца ц/с/к</span><span id="rings">—</span></div>
+    </div>
+    <div class="panel">
+      <h2>Слои</h2>
+      <div class="row">
+        <button id="lDiff" class="on">дельты</button>
+        <button id="lFill">тайлы</button>
+        <button id="lEdge">границы</button>
+        <button id="lHot">горячие</button>
+        <button id="lClan">кланы</button>
+        <button id="lAuthor">авторы</button>
+        <button id="lAge">возраст</button>
+        <button id="lGrid">сетка</button>
+      </div>
+      <div class="legend" id="legend"></div>
+    </div>
+    <div class="panel">
+      <h2>Кланы</h2>
+      <table><thead><tr><th>клан</th><th class="num">на поле</th><th class="num">покрытие</th><th class="num">пикселей</th><th class="num">люди</th></tr></thead>
+      <tbody id="clanBody"><tr><td colspan="5" style="color:var(--dim)">нет авторского слоя</td></tr></tbody></table>
+      <div id="claninfo"></div>
+    </div>
+    <div class="panel">
+      <h2>Авторы</h2>
+      <table><thead><tr><th>имя</th><th class="num">клетки</th><th class="num">доля</th></tr></thead>
+      <tbody id="authorBody"><tr><td colspan="3" style="color:var(--dim)">нет данных</td></tr></tbody></table>
+    </div>
+    <div class="panel">
+      <h2>Памятники</h2>
+      <div id="mono" style="color:var(--dim);font-size:11.5px">—</div>
+    </div>
+    <div class="panel">
+      <h2>Возраст клеток</h2>
+      <div id="ageBars"></div>
+    </div>
+    <div class="panel">
+      <h2>Интервалы постановок</h2>
+      <canvas id="ivals" width="640" height="68"></canvas>
+    </div>
+    <div class="panel">
+      <h2>Палитра</h2>
+      <div class="swatches" id="pal"></div>
+    </div>
+  </div>
+</main>
+<div id="toasts"></div>
+<script>
+const $ = id => document.getElementById(id);
+const F = $('field'), O = $('overlay'), fc = F.getContext('2d'), oc = O.getContext('2d');
+const fimg = fc.createImageData(512, 512);
+
+const S = {
+  w: 512, h: 512, pal: [], colors: null, prev: null, prev2: null,
+  last: null, nextAt: 0, auto: true, timer: null,
+  fillHist: [], seqHist: [], changeHist: [],
+  tileFill: new Float32Array(32 * 32), tileEdge: new Float32Array(32 * 32), tileHot: new Float32Array(32 * 32),
+  revert: 0, dups: 0,
+  clanMap: null, clanNames: [], authorMap: null, authorNames: [], ageMap: null, ageHist: null, ageBuckets: [],
+  layer: {diff: true, fill: false, edge: false, hot: false, clan: false, author: false, age: false, grid: false},
+  view: {scale: 1, x: 0, y: 0},
+  feed: [], feedSeen: 0, lastFeedAt: 0, prevSec: 0,
+};
+
+function rgb(hex){ const n = parseInt(hex.slice(1),16); return [n>>16&255,n>>8&255,n&255]; }
+function hue(seed){ let h=0; for (let i=0;i<seed.length;i++) h=(h*31+seed.charCodeAt(i))%360; return h; }
+function hsl(seed, s=68, l=55){ return `hsl(${hue(seed)} ${s}% ${l}%)`; }
+function hslToRgb(h,s,l){ const f=n=>{const k=(n+h*12)%12; const a=s*Math.min(l,1-l); return l-a*Math.max(-1,Math.min(k-3,9-k,1));}; return [f(0),f(8),f(4)].map(v=>Math.round(v*255)); }
+
+/* ---------------- рисование поля ---------------- */
+function paint(colors){
+  const d = fimg.data;
+  for (let i=0;i<colors.length;i++){
+    const v = rgb(S.pal[colors[i]] || '#000000'), j=i*4;
+    d[j]=v[0]; d[j+1]=v[1]; d[j+2]=v[2]; d[j+3]=255;
+  }
+  fc.putImageData(fimg,0,0);
+}
+
+/* ---------------- статистика ---------------- */
+function computeStats(c){
+  const cnt = new Array(32).fill(0);
+  let fill=0, edge=0;
+  for (let i=0;i<c.length;i++){ if(c[i]) fill++; cnt[c[i]]++; }
+  for (let y=0;y<S.h;y++) for (let x=0;x<S.w;x++){
+    const v = c[y*S.w+x];
+    if (x+1<S.w && c[y*S.w+x+1]!==v) edge++;
+    if (y+1<S.h && c[(y+1)*S.w+x]!==v) edge++;
+  }
+  let ent=0; for (const n of cnt){ if(!n) continue; const p=n/c.length; ent-=p*Math.log2(p); }
+  return {cnt, fill, edge, ent};
+}
+
+function tileStats(c){
+  const T=16, N=32, fill=new Float32Array(1024), edge=new Float32Array(1024);
+  for (let ty=0;ty<N;ty++) for (let tx=0;tx<N;tx++){
+    let f=0,e=0;
+    for (let y=ty*T;y<ty*T+T;y++) for (let x=tx*T;x<tx*T+T;x++){
+      const v=c[y*S.w+x]; if(v) f++;
+      if (x+1<S.w && c[y*S.w+x+1]!==v) e++;
+      if (y+1<S.h && c[(y+1)*S.w+x]!==v) e++;
+    }
+    const k=ty*N+tx; fill[k]=f/(T*T); edge[k]=e/(2*T*T);
+  }
+  return {fill, edge};
+}
+
+function regions(c, limit=5){
+  const W=S.w, H=S.h, seen=new Uint8Array(W*H), out=[];
+  const stack=new Int32Array(W*H);
+  for (let i=0;i<W*H;i++){
+    if (seen[i] || !c[i]) continue;
+    const col=c[i]; let sp=0; stack[sp++]=i; seen[i]=1;
+    let area=0, x0=W, y0=H, x1=0, y1=0;
+    while (sp){
+      const p=stack[--sp]; area++;
+      const x=p%W, y=(p-x)/W;
+      if (x<x0)x0=x; if (y<y0)y0=y; if (x>x1)x1=x; if (y>y1)y1=y;
+      if (x>0){ const q=p-1; if(!seen[q]&&c[q]===col){seen[q]=1;stack[sp++]=q;} }
+      if (x<W-1){ const q=p+1; if(!seen[q]&&c[q]===col){seen[q]=1;stack[sp++]=q;} }
+      if (y>0){ const q=p-W; if(!seen[q]&&c[q]===col){seen[q]=1;stack[sp++]=q;} }
+      if (y<H-1){ const q=p+W; if(!seen[q]&&c[q]===col){seen[q]=1;stack[sp++]=q;} }
+    }
+    if (area >= 16) out.push({area, color:col, x0, y0, x1, y1});
+  }
+  out.sort((a,b)=>b.area-a.area);
+  return {count: out.length, top: out.slice(0, limit)};
+}
+
+function freeRect(c){
+  const W=S.w, H=S.h, h=new Int32Array(W);
+  let best={area:0,x:0,y:0,w:0,h:0};
+  for (let y=0;y<H;y++){
+    for (let x=0;x<W;x++) h[x] = c[y*W+x] ? 0 : h[x]+1;
+    const st=[];
+    for (let x=0;x<=W;x++){
+      const cur = x<W ? h[x] : 0;
+      while (st.length && h[st[st.length-1]] >= cur){
+        const top=st.pop();
+        const height=h[top];
+        const left = st.length ? st[st.length-1]+1 : 0;
+        const width = x-left;
+        const area = height*width;
+        if (area>best.area) best={area,x:left,y:y-height+1,w:width,h:height};
+      }
+      st.push(x);
+    }
+  }
+  return best;
+}
+
+function tileDupes(c){
+  const T=16, N=32, seen=new Map();
+  let dupes=0;
+  for (let ty=0;ty<N;ty++) for (let tx=0;tx<N;tx++){
+    let hsh=2166136261>>>0;
+    for (let y=ty*T;y<ty*T+T;y++) for (let x=tx*T;x<tx*T+T;x++){
+      hsh = (hsh ^ c[y*S.w+x]) >>> 0; hsh = (hsh * 16777619) >>> 0;
+    }
+    const k=hsh + ':' + ty + ':' + tx;
+    if (seen.has(hsh)) dupes++; else seen.set(hsh, k);
+  }
+  return dupes;
+}
+
+function rings(c){
+  const W=S.w, H=S.h, cx=(W-1)/2, cy=(H-1)/2, maxd=Math.hypot(cx,cy);
+  const t=[0,0,0], n=[0,0,0];
+  for (let y=0;y<H;y++) for (let x=0;x<W;x++){
+    const d=Math.hypot(x-cx,y-cy)/maxd;
+    const b = d<0.4?0:(d<0.75?1:2);
+    n[b]++; if (c[y*W+x]) t[b]++;
+  }
+  return t.map((v,i)=> (v/n[i]*100).toFixed(1));
+}
+
+/* ---------------- оверлеи ---------------- */
+function clearOverlay(){ oc.clearRect(0,0,S.w,S.h); }
+
+function drawDiff(){
+  if (!S.prev || !S.colors) return;
+  const img=oc.createImageData(S.w,S.h), d=img.data;
+  for (let i=0;i<S.colors.length;i++){
+    if (S.prev[i]!==S.colors[i]){ const j=i*4; d[j]=255; d[j+1]=122; d[j+2]=26; d[j+3]=215; }
+  }
+  oc.putImageData(img,0,0);
+}
+
+function drawTilesData(kind){
+  clearOverlay();
+  const T=16, N=32;
+  for (let ty=0;ty<N;ty++) for (let tx=0;tx<N;tx++){
+    const k=ty*N+tx;
+    const v = kind==='fill' ? S.tileFill[k] : kind==='edge' ? S.tileEdge[k]*1.6 : S.tileHot[k];
+    if (v<=0.01) continue;
+    oc.fillStyle = kind==='edge' ? `rgba(255,122,26,${Math.min(1,v)})`
+                 : kind==='hot' ? `rgba(240,53,59,${Math.min(1,v)})`
+                 : `rgba(95,184,255,${Math.min(1,v)})`;
+    oc.fillRect(tx*T,ty*T,T,T);
+  }
+}
+
+function drawGrid(){
+  clearOverlay();
+  oc.strokeStyle='rgba(255,255,255,.13)'; oc.lineWidth=1;
+  for (let x=0;x<=S.w;x+=32){ oc.beginPath(); oc.moveTo(x+.5,0); oc.lineTo(x+.5,S.h); oc.stroke(); }
+  for (let y=0;y<=S.h;y+=32){ oc.beginPath(); oc.moveTo(0,y+.5); oc.lineTo(S.w,y+.5); oc.stroke(); }
+}
+
+function drawByteMap(map, names, seedFn){
+  clearOverlay();
+  if (!map) return;
+  const img=oc.createImageData(S.w,S.h), d=img.data;
+  const cache = new Map();
+  for (let i=0;i<map.length;i++){
+    const k=map[i]; if(!k) continue;
+    let col = cache.get(k);
+    if (!col){ const seed = names[k-1] || String(k); col = hsl(seed); cache.set(k,col); }
+    const [h,s,l]=col.match(/[\d.]+/g).map(Number);
+    const v=hslToRgb(h/360,s/100,l/100), j=i*4;
+    d[j]=v[0]; d[j+1]=v[1]; d[j+2]=v[2]; d[j+3]=232;
+  }
+  oc.putImageData(img,0,0);
+}
+
+function drawAge(){
+  clearOverlay();
+  if (!S.ageMap) return;
+  const shades=[[0,0,0],[80,180,255],[70,150,235],[60,120,210],[120,90,200],[190,80,170],[230,90,90],[255,140,40]];
+  const img=oc.createImageData(S.w,S.h), d=img.data;
+  for (let i=0;i<S.ageMap.length;i++){
+    const k=S.ageMap[i]; if(!k) continue;
+    const v=shades[k-1]||[255,255,255], j=i*4;
+    d[j]=v[0]; d[j+1]=v[1]; d[j+2]=v[2]; d[j+3]=230;
+  }
+  oc.putImageData(img,0,0);
+}
+
+function repaintLayer(){
+  if (S.layer.age) return drawAge();
+  if (S.layer.author) return drawByteMap(S.authorMap, (S.authorNames||[]).map(a=>a.pid), null);
+  if (S.layer.clan) return drawByteMap(S.clanMap, S.clanNames, null);
+  if (S.layer.hot) return drawTilesData('hot');
+  if (S.layer.edge) return drawTilesData('edge');
+  if (S.layer.fill) return drawTilesData('fill');
+  if (S.layer.grid) return drawGrid();
+  if (S.layer.diff) return drawDiff();
+  clearOverlay();
+}
+
+/* ---------------- вид: зум и пан ---------------- */
+function applyView(){
+  const tr = `translate(${S.view.x}px, ${S.view.y}px) scale(${S.view.scale})`;
+  F.style.transform = tr; O.style.transform = tr;
+  F.style.transformOrigin = O.style.transformOrigin = '0 0';
+}
+function stagePoint(ev){
+  const rect = F.getBoundingClientRect();
+  const x = (ev.clientX - rect.left) / rect.width * S.w;
+  const y = (ev.clientY - rect.top) / rect.height * S.h;
+  return {x: Math.floor(x), y: Math.floor(y)};
+}
+$('stage').addEventListener('wheel', ev => {
+  ev.preventDefault();
+  const rect = F.getBoundingClientRect();
+  const px = (ev.clientX - rect.left)/rect.width, py = (ev.clientY - rect.top)/rect.height;
+  const before = S.view.scale;
+  S.view.scale = Math.max(1, Math.min(8, S.view.scale * (ev.deltaY < 0 ? 1.25 : 0.8)));
+  const k = S.view.scale/before;
+  const st = $('stage');
+  S.view.x = (S.view.x - px*st.clientWidth) * k + px*st.clientWidth;
+  S.view.y = (S.view.y - py*st.clientHeight) * k + py*st.clientHeight;
+  applyView();
+}, {passive:false});
+let drag = null;
+$('stage').addEventListener('pointerdown', ev => { drag = {x:ev.clientX, y:ev.clientY}; });
+window.addEventListener('pointerup', () => { drag = null; });
+window.addEventListener('pointermove', ev => {
+  if (!drag) return;
+  S.view.x += ev.clientX - drag.x; S.view.y += ev.clientY - drag.y;
+  drag = {x:ev.clientX, y:ev.clientY};
+  applyView();
+});
+$('zIn').onclick = () => { S.view.scale=Math.min(8,S.view.scale*1.3); applyView(); };
+$('zOut').onclick = () => { S.view.scale=Math.max(1,S.view.scale/1.3); applyView(); };
+$('zReset').onclick = () => { S.view={scale:1,x:0,y:0}; applyView(); };
+
+/* ---------------- миникарта ---------------- */
+function drawMinimap(c){
+  const m=$('minimap'), mc=m.getContext('2d');
+  const img=mc.createImageData(64,64);
+  for (let y=0;y<64;y++) for (let x=0;x<64;x++){
+    const v=c[(y*8)*S.w + x*8];
+    const rgbv=rgb(S.pal[v]||'#000'), j=(y*64+x)*4;
+    img.data[j]=rgbv[0]; img.data[j+1]=rgbv[1]; img.data[j+2]=rgbv[2]; img.data[j+3]=255;
+  }
+  mc.putImageData(img,0,0);
+  mc.strokeStyle='#5FB8FF'; mc.lineWidth=1;
+  mc.strokeRect(.5,.5,63,63);
+}
+$('minimap').onclick = ev => {
+  const r=$('minimap').getBoundingClientRect();
+  const x=(ev.clientX-r.left)/r.width, y=(ev.clientY-r.top)/r.height;
+  const st=$('stage');
+  S.view.x = -x*st.clientWidth*S.view.scale + st.clientWidth/2;
+  S.view.y = -y*st.clientHeight*S.view.scale + st.clientHeight/2;
+  applyView();
+};
+
+/* ---------------- графики ---------------- */
+function spark(){
+  const s=$('spark'), c=s.getContext('2d');
+  c.clearRect(0,0,s.width,s.height);
+  const h=S.seqHist, max=Math.max(1,...h), bw=s.width/Math.max(h.length,1);
+  h.forEach((v,i)=>{ const bh=(v/max)*(s.height-8); c.fillStyle=i===h.length-1?'#5FB8FF':'#2B74E0'; c.fillRect(i*bw+1,s.height-bh-2,Math.max(1,bw-2),bh); });
+  c.fillStyle='#8a8a8a'; c.font='9px monospace'; c.fillText('max '+max,2,9);
+}
+
+function stackChart(){
+  const s=$('stack'), c=s.getContext('2d');
+  c.clearRect(0,0,s.width,s.height);
+  if (!S.stackHist || !S.stackHist.length) return;
+  const n=S.stackHist.length, bw=s.width/n;
+  for (let i=0;i<n;i++){
+    const row=S.stackHist[i]; let acc=0;
+    const total=row.reduce((a,b)=>a+b,0)||1;
+    for (let k=0;k<row.length;k++){
+      if (!row[k]) continue;
+      const hh=(row[k]/total)*(s.height-4);
+      c.fillStyle=S.pal[k]||'#888';
+      c.fillRect(i*bw, s.height-2-acc-hh, Math.max(1,bw-1), hh);
+      acc+=hh;
+    }
+  }
+}
+
+function ivals(){
+  const s=$('ivals'), c=s.getContext('2d');
+  c.clearRect(0,0,s.width,s.height);
+  const per=S.secCounts||{};
+  const vals=Object.values(per);
+  if (!vals.length) return;
+  const max=Math.max(...vals,1);
+  const bins=new Array(16).fill(0);
+  for (const v of vals) bins[Math.min(15, v)]++;
+  const m=Math.max(...bins,1), bw=s.width/16;
+  bins.forEach((v,i)=>{ const hh=(v/m)*(s.height-4); c.fillStyle=i===max?'#F0353B':'#2B74E0'; c.fillRect(i*bw+1,s.height-hh-2,bw-2,hh); });
+  c.fillStyle='#8a8a8a'; c.font='9px monospace';
+  c.fillText('0/с',2,9); c.fillText(max+'/с', s.width-34, 9);
+}
+
+/* ---------------- панели ---------------- */
+function fmtT(ms){ return new Date(ms).toLocaleTimeString('ru-RU',{hour12:false}); }
+
+function toast(msg){
+  const d=document.createElement('div'); d.className='toast'; d.textContent=msg;
+  $('toasts').appendChild(d);
+  setTimeout(()=>d.remove(), 9000);
+}
+
+function setText(id, v){ const el=$(id); if (el) el.textContent = v; }
+
+async function load(){
+  $('conn').textContent='fetching'; $('conn').className='badge wait';
+  try{
+    const j = await (await fetch('/snapshot',{cache:'no-store'})).json();
+    S.w=j.w; S.h=j.h; S.pal=j.palette.length?j.palette:S.pal;
+    const bin=atob(j.colors), colors=new Uint8Array(bin.length);
+    for (let i=0;i<bin.length;i++) colors[i]=bin.charCodeAt(i);
+
+    const st = computeStats(colors);
+    const tl = tileStats(colors);
+    const rg = regions(colors);
+    const fr = freeRect(colors);
+    const dups = tileDupes(colors);
+    const rn = rings(colors);
+
+    let changed = 0, revert = 0;
+    if (S.colors){
+      for (let i=0;i<colors.length;i++){
+        if (S.colors[i]!==colors[i]) changed++;
+        if (S.prev && S.colors[i]!==colors[i] && S.prev[i]===colors[i]) revert++;
+      }
+    }
+    const evDelta = (S.last && j.seq>=S.last.seq) ? j.seq-S.last.seq : null;
+
+    if (S.fillHist.length){
+      const lastFill=S.fillHist[S.fillHist.length-1];
+      S.rate = (st.fill-lastFill)/15*60;   // клеток в минуту
+    }
+    S.fillHist.push(st.fill); if (S.fillHist.length>200) S.fillHist.shift();
+    if (evDelta!==null){ S.seqHist.push(evDelta); if(S.seqHist.length>40) S.seqHist.shift(); }
+
+    // z-score
+    let z = '—';
+    if (S.seqHist.length>4){
+      const arr=S.seqHist.slice(0,-1), mean=arr.reduce((a,b)=>a+b,0)/arr.length;
+      const sd=Math.sqrt(arr.reduce((a,b)=>a+(b-mean)**2,0)/arr.length)||1;
+      z = ((S.seqHist[S.seqHist.length-1]-mean)/sd).toFixed(1);
+    }
+
+    // накопление горячих тайлов
+    if (S.colors){
+      for (let i=0;i<colors.length;i++) if (S.colors[i]!==colors[i]){
+        const x=i%S.w, y=(i-x)/S.w;
+        S.tileHot[Math.floor(y/16)*32+Math.floor(x/16)] += 0.12;
+      }
+    }
+
+    paint(colors);
+    S.prev2 = S.prev; S.prev = S.colors; S.colors = colors;
+    S.tileFill=tl.fill; S.tileEdge=tl.edge;
+    S.dups=dups; S.revert=revert;
+    repaintLayer();
+    drawMinimap(colors);
+
+    setText('fill', (st.fill/(S.w*S.h)*100).toFixed(2)+'%');
+    $('fillBar').style.width=(st.fill/(S.w*S.h)*100).toFixed(2)+'%';
+    setText('cells', st.fill.toLocaleString('ru-RU')+' / '+(S.w*S.h).toLocaleString('ru-RU'));
+    setText('ncolors', st.cnt.filter(c=>c).length+' / '+st.cnt.length);
+    setText('entropy', st.ent.toFixed(2)+' бит');
+    setText('edges', st.edge.toLocaleString('ru-RU'));
+    setText('seq', j.seq.toLocaleString('ru-RU'));
+    setText('rate', (S.rate??0).toFixed(1)+' кл/мин');
+    const left=(S.w*S.h)-st.fill;
+    setText('eta', (S.rate>0.5) ? (left/S.rate/60).toFixed(1)+' ч' : 'не растёт');
+    setText('zscore', z);
+    setText('winEv', evDelta===null?'—':evDelta);
+    setText('winCells', changed?changed.toLocaleString('ru-RU'):'0');
+    setText('reverts', revert.toLocaleString('ru-RU'));
+    setText('turb', (changed/(S.w*S.h)*100).toFixed(3)+'%');
+    setText('regions', rg.count.toLocaleString('ru-RU'));
+    setText('biggest', rg.top[0] ? rg.top[0].area+' кл @ '+rg.top[0].x0+','+rg.top[0].y0 : '—');
+    setText('free', fr.area ? fr.w+'×'+fr.h+' @ '+fr.x+','+fr.y : '—');
+    setText('dups', dups);
+    setText('rings', rn.join(' / ')+'%');
+    setText('snapAge', fmtT(j.fetchedAt));
+    setText('srvTime', fmtT(j.serverNow||j.fetchedAt));
+    setText('phase', j.phase||'—');
+    setText('online', 'online '+(j.online??'—'));
+    S.bot = j.bot || S.bot;
+
+    // стек по цветам (раз в окно)
+    S.stackHist = S.stackHist || [];
+    S.stackHist.push(Array.from(st.cnt)); if (S.stackHist.length>40) S.stackHist.shift();
+    stackChart(); spark(); ivals();
+
+    // палитра
+    const pal=$('pal'); pal.innerHTML='';
+    S.pal.forEach((c,i)=>{
+      const n=st.cnt[i]||0, el=document.createElement('div');
+      el.className='sw'; el.style.background=c; el.title=i+': '+c+' — '+n;
+      pal.appendChild(el);
+    });
+
+    if (z!=='—' && Number(z)>3) toast('всплеск активности: z='+z);
+    if (st.fill/(S.w*S.h)*100>40 && !S.warned40){ S.warned40=true; toast('заполнение поля больше 40%'); }
+
+    S.last=j; S.nextAt=Date.now()+15000;
+    $('conn').textContent='live'; $('conn').className='badge ok'; setText('err','');
+    loadDerived();
+  }catch(e){
+    $('conn').textContent='offline'; $('conn').className='badge bad'; setText('err', e.message);
+  }
+}
+
+/* ---------------- производные данные ---------------- */
+async function loadDerived(){
+  try{
+    const c = await (await fetch('/clans',{cache:'no-store'})).json();
+    let pr = {done:0,target:0,pct:0};
+    try { pr = await (await fetch('/progress',{cache:'no-store'})).json(); } catch(e){}
+    const painted = S.last && S.last.painted ? S.last.painted : 0;
+    const body=$('clanBody'); body.innerHTML='';
+    if (!c.clans.length){
+      body.innerHTML='<tr><td colspan="5" style="color:var(--dim)">нет авторского слоя</td></tr>';
+    } else {
+      for (const k of c.clans.slice(0,10)){
+        const tr=document.createElement('tr'); tr.className='click';
+        const o = k.official || null;
+        const field = o && o.cells != null ? o.cells : Math.round(k.share/100*painted);
+        const cover = (o && o.cells != null) ? (o.cells/(S.w*S.h)*100) : k.share;
+        const px = o && o.pixels != null ? o.pixels : '—';
+        tr.innerHTML='<td style="color:'+hsl(k.tag)+'">'+k.tag+'</td>'
+          +'<td class="num">'+(o?'':'≈')+field.toLocaleString('ru-RU')+'</td>'
+          +'<td class="num"><div class="mini" style="width:'+Math.min(100,cover)+'%"></div>'+cover.toFixed(1)+'%</td>'
+          +'<td class="num">'+(px==='—'?'—':px.toLocaleString('ru-RU'))+'</td>'
+          +'<td class="num">'+(o&&o.members!=null?o.members:k.members)+'</td>';
+        tr.onclick=()=>showClan(k.tag);
+        body.appendChild(tr);
+      }
+    }
+    setText('claninfo','авторский слой: '+pr.done.toLocaleString('ru-RU')+' / '+pr.target.toLocaleString('ru-RU')
+      +' клеток ('+pr.pct+'%)'+(c.token?' · официальные цифры с сервера':' · оценка по выборке'));
+  }catch(e){}
+
+  try{
+    const a = await (await fetch('/authors',{cache:'no-store'})).json();
+    S.authorNames=a.authors;
+    S.authorMap = a.map ? b64(a.map) : null;
+    const body=$('authorBody'); body.innerHTML='';
+    const total=a.authors.reduce((s,x)=>s+x.cells,0)||1;
+    a.authors.slice(0,10).forEach((x,i)=>{
+      const tr=document.createElement('tr');
+      tr.innerHTML='<td style="color:'+hsl(x.pid)+'">'+x.name+'</td>'
+        +'<td class="num">'+x.cells.toLocaleString('ru-RU')+'</td>'
+        +'<td class="num">'+(x.cells/total*100).toFixed(1)+'%</td>';
+      body.appendChild(tr);
+    });
+    if (!a.authors.length) body.innerHTML='<tr><td colspan="3" style="color:var(--dim)">нет данных</td></tr>';
+  }catch(e){}
+
+  try{
+    const g = await (await fetch('/age',{cache:'no-store'})).json();
+    S.ageMap = g.map ? b64(g.map) : null;
+    S.ageBuckets = g.buckets;
+    const max=Math.max(...g.hist,1);
+    $('ageBars').innerHTML = g.hist.map((v,i)=>
+      '<div class="kv"><span>'+g.buckets[i]+'</span><span>'+v.toLocaleString('ru-RU')+'</span></div>'
+      +'<div class="bar"><i style="width:'+(v/max*100).toFixed(1)+'%;background:linear-gradient(90deg,#2B74E0,#5FB8FF)"></i></div>'
+    ).join('');
+  }catch(e){}
+
+  try{
+    const m = await (await fetch('/monuments',{cache:'no-store'})).json();
+    $('mono').innerHTML = m.slice(0,8).map(p=>
+      '('+p.x+','+p.y+') <b style="color:'+hsl(p.pid)+'">'+p.name+'</b>'
+      + (p.clan?' ['+p.clan+']':'') + ' · ' + new Date(p.ts).toLocaleString('ru-RU',{hour12:false})
+    ).join('<br>') || '—';
+  }catch(e){}
+
+  try{ await loadClanMap(); }catch(e){}
+  try{
+    if (!S.clanNames.length) {} 
+  }catch(e){}
+}
+
+function b64(s){
+  const bin=atob(s), out=new Uint8Array(bin.length);
+  for (let i=0;i<bin.length;i++) out[i]=bin.charCodeAt(i);
+  return out;
+}
+
+async function showClan(tag){
+  const box=$('claninfo'); box.textContent=tag+': запрос…';
+  try{
+    const j=await (await fetch('/clan?tag='+encodeURIComponent(tag))).json();
+    box.innerHTML='<b>'+tag+'</b><br>'+j.players.slice(0,6).map(p=>'· '+p.name+' — '+p.cells).join('<br>');
+  }catch(e){ box.textContent='ошибка: '+e.message; }
+}
+
+async function loadClanMap(){
+  const j=await (await fetch('/clanmap',{cache:'no-store'})).json();
+  S.clanNames=j.names||[];
+  S.clanMap = j.map ? b64(j.map) : null;
+  $('legend').innerHTML = S.clanNames.slice(0,8).map(t=>'<span><i style="background:'+hsl(t)+'"></i>'+t+'</span>').join('');
+}
+
+/* ---------------- лента событий ---------------- */
+async function pollFeed(){
+  try{
+    fetch('/events?since='+S.feedSeen,{cache:'no-store'}).then(r=>r.json()).then(j=>{
+      setText('feedState', j.err ? 'ошибка: '+j.err : ('seq '+j.last_seq));
+      if (j.events && j.events.length){
+        S.secCounts = S.secCounts || {};
+        for (const e of j.events){
+          S.feed.unshift(e);
+          S.secCounts[e.sec] = (S.secCounts[e.sec]||0)+1;
+        }
+        S.feed = S.feed.slice(0,120);
+        S.feedSeen = Math.max(S.feedSeen, j.events[j.events.length-1].seq);
+        const keys=Object.keys(S.secCounts).map(Number).sort((a,b)=>a-b);
+        for (const k of keys.slice(0, keys.length-600)) delete S.secCounts[k];
+        renderFeed(); ivals();
+      }
+    }).catch(()=>setText('feedState','offline'));
+  }catch(e){ setText('feedState','offline'); }
+}
+
+function renderFeed(){
+  $('feed').innerHTML = S.feed.slice(0,14).map(e=>
+    '<div>'+(e.sec?new Date(e.sec*1000).toLocaleTimeString('ru-RU',{hour12:false}):'')
+    +' <b>('+e.x+','+e.y+')</b> c'+e.c+' <span style="color:'+S.pal[e.c]+'">■</span></div>'
+  ).join('');
+}
+
+/* ---------------- клик по клетке ---------------- */
+$('field').addEventListener('click', async ev => {
+  const p = stagePoint(ev);
+  if (p.x<0||p.y<0||p.x>=S.w||p.y>=S.h) return;
+  const info=$('cellinfo');
+  S.picked = p;
+  info.textContent='('+p.x+','+p.y+') — запрос…';
+  try{
+    const j=await (await fetch('/cell?x='+p.x+'&y='+p.y)).json();
+    if (!j.by){ info.innerHTML='<b>('+p.x+','+p.y+')</b> — никто не ставил'; return; }
+    const t=j.ts?new Date(j.ts).toLocaleString('ru-RU',{hour12:false}):'—';
+    info.innerHTML='<b>('+p.x+','+p.y+')</b> · color '+j.color+' · <b style="color:'+hsl(j.by.pid)+'">'+j.by.name+'</b>'
+      +(j.by.clan_tag?' ['+j.by.clan_tag+']':'')+' · pid '+j.by.pid+'<br>'+t;
+  }catch(e){ info.textContent='ошибка: '+e.message; }
+});
+
+$('deep').onclick = () => {
+  const p = S.picked || {x:256,y:256};
+  const param = '#x='+p.x+'&y='+p.y+'&z=1';
+  const bot = S.bot || 'exterapixelbattle_bot';
+  window.open('https://t.me/'+bot+'?start='+encodeURIComponent(param), '_blank');
+};
+
+/* ---------------- экспорт ---------------- */
+$('expPng').onclick = () => {
+  const a=document.createElement('a');
+  a.href=F.toDataURL('image/png');
+  a.download='pixel-'+Math.floor(Date.now()/1000)+'.png';
+  a.click();
+};
+$('expCsv').onclick = () => {
+  const rows=[['metric','value']];
+  for (const el of document.querySelectorAll('.panel')) {
+    for (const kv of el.querySelectorAll('.kv')){
+      rows.push([kv.children[0].textContent, kv.children[1].textContent]);
+    }
+  }
+  const blob=new Blob([rows.map(r=>r.join(';')).join('\n')],{type:'text/csv'});
+  const a=document.createElement('a');
+  a.href=URL.createObjectURL(blob); a.download='pxboard-'+Math.floor(Date.now()/1000)+'.csv'; a.click();
+};
+
+/* ---------------- кнопки слоёв ---------------- */
+function layerBtn(id, key){
+  $(id).onclick = e => {
+    for (const k in S.layer) S.layer[k]=false;
+    S.layer[key]=true;
+    for (const [bid,bk] of [['lDiff','diff'],['lFill','fill'],['lEdge','edge'],['lHot','hot'],
+                            ['lClan','clan'],['lAuthor','author'],['lAge','age'],['lGrid','grid']]){
+      $(bid).classList.toggle('on', bk===key);
+    }
+    repaintLayer();
+  };
+}
+layerBtn('lDiff','diff'); layerBtn('lFill','fill'); layerBtn('lEdge','edge'); layerBtn('lHot','hot');
+layerBtn('lClan','clan'); layerBtn('lAuthor','author'); layerBtn('lAge','age'); layerBtn('lGrid','grid');
+
+$('btnNow').onclick = load;
+$('btnAuto').onclick = () => {
+  S.auto=!S.auto; $('btnAuto').classList.toggle('on', S.auto);
+  clearInterval(S.timer);
+  if (S.auto){ S.timer=setInterval(load,15000); S.nextAt=Date.now()+15000; }
+};
+
+setInterval(()=>{
+  if (!S.auto){ setText('timer','paused'); return; }
+  setText('timer', Math.max(0,Math.ceil((S.nextAt-Date.now())/1000))+'s');
+}, 500);
+
+load();
+S.timer = setInterval(load, 15000);
+setInterval(pollFeed, 2000);
+setInterval(loadDerived, 60000);
+</script>
+</body></html>
+"""
+
+
+# ---------------------------------------------------------------- HTTP
+
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, fmt, *args):
+        pass
+
+    def _send(self, code, body, ctype):
+        if isinstance(body, str):
+            body = body.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _json(self, obj, code=200):
+        self._send(code, json.dumps(obj), "application/json")
+
+    def do_GET(self):
+        p = urllib.parse.urlparse(self.path)
+        q = urllib.parse.parse_qs(p.query)
+        try:
+            if p.path in ("/", "/index.html"):
+                return self._send(200, HTML, "text/html; charset=utf-8")
+            if p.path == "/snapshot":
+                return self._json(get_snapshot())
+            if p.path == "/cell":
+                x = int(q.get("x", ["0"])[0])
+                y = int(q.get("y", ["0"])[0])
+                return self._send(200, fetch("/api/cell?x=%d&y=%d" % (x, y)), "application/json")
+            if p.path == "/clans":
+                data = clan_stats()
+                data["deltas"] = clan_delta()
+                by = {d["tag"]: d for d in data["deltas"]}
+                for c in data["clans"]:
+                    d = by.get(c["tag"])
+                    if d:
+                        c["delta"] = d["delta"]
+                return self._json(data)
+            if p.path == "/clan":
+                tag = q.get("tag", [""])[0]
+                return self._json({"tag": tag, "players": [
+                    {"name": r[0], "pid": r[1], "cells": r[2], "first": r[3], "last": r[4]}
+                    for r in clan_pixels(tag)]})
+            if p.path == "/clanmap":
+                return self._json(clan_map())
+            if p.path == "/authors":
+                return self._json(author_map())
+            if p.path == "/progress":
+                return self._json(progress())
+            if p.path == "/age":
+                return self._json(age_map())
+            if p.path == "/monuments":
+                return self._json(monuments())
+            if p.path == "/neighbours":
+                return self._json(neighbours())
+            if p.path == "/events":
+                since = int(q.get("since", ["0"])[0] or 0)
+                ev = [e for e in list(EVENTS) if e["seq"] > since]
+                return self._json({"events": ev[-200:], "last_seq": FEED["last_seq"],
+                                   "seg": FEED["seg"], "err": FEED["err"]})
+        except Exception as e:
+            return self._json({"err": str(e)}, 500)
+        if p.path == "/favicon.ico":
+            return self._send(204, b"", "image/x-icon")
+        return self._json({"err": "not_found"}, 404)
+
+
+def main():
+    global TOKEN, DB_PATH
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--port", type=int, default=8808)
+    ap.add_argument("--host", default="127.0.0.1")
+    ap.add_argument("--token", default="")
+    ap.add_argument("--db", default=DB_PATH)
+    a = ap.parse_args()
+    TOKEN = a.token
+    DB_PATH = a.db
+    threading.Thread(target=feed_loop, daemon=True).start()
+    print("pxboard: http://%s:%d/  db=%s  token=%s"
+          % (a.host, a.port, DB_PATH, "есть" if TOKEN else "нет"))
+    ThreadingHTTPServer((a.host, a.port), Handler).serve_forever()
+
+
+if __name__ == "__main__":
+    main()
