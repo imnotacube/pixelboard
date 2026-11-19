@@ -450,8 +450,8 @@ tr.click{cursor:pointer}tr.click:hover td{background:#202020}
 <main>
   <div>
     <div class="stage" id="stage">
-      <canvas id="field" width="512" height="512"></canvas>
-      <canvas id="overlay" width="512" height="512"></canvas>
+      <canvas id="field" width="612" height="612"></canvas>
+      <canvas id="overlay" width="612" height="612"></canvas>
     </div>
     <div class="panel" style="margin-top:10px">
       <h2>Вид</h2>
@@ -555,19 +555,43 @@ tr.click{cursor:pointer}tr.click:hover td{background:#202020}
 <script>
 const $ = id => document.getElementById(id);
 const F = $('field'), O = $('overlay'), fc = F.getContext('2d'), oc = O.getContext('2d');
-const fimg = fc.createImageData(512, 512);
+const fimgPlaceholder = null;
 
+const TILE = 16;
 const S = {
-  w: 512, h: 512, pal: [], colors: null, prev: null, prev2: null,
+  w: 612, h: 612, pal: [], colors: null, prev: null, prev2: null,
   last: null, nextAt: 0, auto: true, timer: null,
   fillHist: [], fillT: [], seqHist: [], changeHist: [],
-  tileFill: new Float32Array(32 * 32), tileEdge: new Float32Array(32 * 32), tileHot: new Float32Array(32 * 32),
+  tileN: 1, tileFill: new Float32Array(1), tileEdge: new Float32Array(1), tileHot: new Float32Array(1),
   revert: 0, dups: 0,
-  clanMap: null, clanNames: [], authorMap: null, authorNames: [], ageMap: null, ageHist: null, ageBuckets: [],
   layer: {diff: true, fill: false, edge: false, hot: false, grid: false},
   view: {scale: 1, x: 0, y: 0},
   feed: [], feedSeen: 0, lastFeedAt: 0, prevSec: 0,
 };
+
+let fimg = null;
+
+/* подгоняет полотно и тайловые массивы под размер поля с сервера */
+function fitCanvas(w, h){
+  const changed = (S.w !== w || S.h !== h || !fimg);
+  S.w = w; S.h = h;
+  if (changed){
+    F.width = w; F.height = h;
+    O.width = w; O.height = h;
+    fimg = fc.createImageData(w, h);
+    S.tileN = Math.ceil(Math.max(w, h) / TILE);
+    const n = S.tileN * S.tileN;
+    if (S.tileFill.length !== n){
+      S.tileFill = new Float32Array(n);
+      S.tileEdge = new Float32Array(n);
+      S.tileHot = new Float32Array(n);
+    }
+    S.prev = null; S.prev2 = null; S.colors = null;
+    S.fillHist = []; S.fillT = []; S.seqHist = [];
+    S.view = {scale: 1, x: 0, y: 0};
+    applyView();
+  }
+}
 
 function rgb(hex){ const n = parseInt(hex.slice(1),16); return [n>>16&255,n>>8&255,n&255]; }
 function hue(seed){ let h=0; for (let i=0;i<seed.length;i++) h=(h*31+seed.charCodeAt(i))%360; return h; }
@@ -678,10 +702,11 @@ function theilSen(ts, vs){
 }
 
 function tileStats(c){
-  const T=16, N=32, fill=new Float32Array(1024), edge=new Float32Array(1024);
+  const T=TILE, N=S.tileN;
+  const fill=new Float32Array(N*N), edge=new Float32Array(N*N);
   for (let ty=0;ty<N;ty++) for (let tx=0;tx<N;tx++){
     let f=0,e=0;
-    for (let y=ty*T;y<ty*T+T;y++) for (let x=tx*T;x<tx*T+T;x++){
+    for (let y=ty*T;y<Math.min(ty*T+T,S.h);y++) for (let x=tx*T;x<Math.min(tx*T+T,S.w);x++){
       const v=c[y*S.w+x]; if(v) f++;
       if (x+1<S.w && c[y*S.w+x+1]!==v) e++;
       if (y+1<S.h && c[(y+1)*S.w+x]!==v) e++;
@@ -736,11 +761,11 @@ function freeRect(c){
 }
 
 function tileDupes(c){
-  const T=16, N=32, seen=new Map();
+  const T=TILE, N=S.tileN, seen=new Map();
   let dupes=0;
   for (let ty=0;ty<N;ty++) for (let tx=0;tx<N;tx++){
     let hsh=2166136261>>>0;
-    for (let y=ty*T;y<ty*T+T;y++) for (let x=tx*T;x<tx*T+T;x++){
+    for (let y=ty*T;y<Math.min(ty*T+T,S.h);y++) for (let x=tx*T;x<Math.min(tx*T+T,S.w);x++){
       hsh = (hsh ^ c[y*S.w+x]) >>> 0; hsh = (hsh * 16777619) >>> 0;
     }
     const k=hsh + ':' + ty + ':' + tx;
@@ -774,7 +799,7 @@ function drawDiff(){
 
 function drawTilesData(kind){
   clearOverlay();
-  const T=16, N=32;
+  const T=TILE, N=S.tileN;
   for (let ty=0;ty<N;ty++) for (let tx=0;tx<N;tx++){
     const k=ty*N+tx;
     const v = kind==='fill' ? S.tileFill[k] : kind==='edge' ? S.tileEdge[k]*1.6 : S.tileHot[k];
@@ -789,8 +814,9 @@ function drawTilesData(kind){
 function drawGrid(){
   clearOverlay();
   oc.strokeStyle='rgba(255,255,255,.13)'; oc.lineWidth=1;
-  for (let x=0;x<=S.w;x+=32){ oc.beginPath(); oc.moveTo(x+.5,0); oc.lineTo(x+.5,S.h); oc.stroke(); }
-  for (let y=0;y<=S.h;y+=32){ oc.beginPath(); oc.moveTo(0,y+.5); oc.lineTo(S.w,y+.5); oc.stroke(); }
+  const step = Math.max(16, Math.round(Math.max(S.w, S.h) / 19 / 8) * 8);
+  for (let x=0;x<=S.w;x+=step){ oc.beginPath(); oc.moveTo(x+.5,0); oc.lineTo(x+.5,S.h); oc.stroke(); }
+  for (let y=0;y<=S.h;y+=step){ oc.beginPath(); oc.moveTo(0,y+.5); oc.lineTo(S.w,y+.5); oc.stroke(); }
 }
 
 function drawByteMap(map, names, seedFn){
@@ -846,15 +872,18 @@ $('zReset').onclick = () => { S.view={scale:1,x:0,y:0}; applyView(); };
 /* ---------------- миникарта ---------------- */
 function drawMinimap(c){
   const m=$('minimap'), mc=m.getContext('2d');
-  const img=mc.createImageData(64,64);
-  for (let y=0;y<64;y++) for (let x=0;x<64;x++){
-    const v=c[(y*8)*S.w + x*8];
-    const rgbv=rgb(S.pal[v]||'#000'), j=(y*64+x)*4;
+  const M = 64;
+  const img=mc.createImageData(M,M);
+  const sx = S.w / M, sy = S.h / M;
+  for (let y=0;y<M;y++) for (let x=0;x<M;x++){
+    const px = Math.min(S.w-1, Math.floor(x*sx)), py = Math.min(S.h-1, Math.floor(y*sy));
+    const v=c[py*S.w + px];
+    const rgbv=rgb(S.pal[v]||'#000'), j=(y*M+x)*4;
     img.data[j]=rgbv[0]; img.data[j+1]=rgbv[1]; img.data[j+2]=rgbv[2]; img.data[j+3]=255;
   }
   mc.putImageData(img,0,0);
   mc.strokeStyle='#5FB8FF'; mc.lineWidth=1;
-  mc.strokeRect(.5,.5,63,63);
+  mc.strokeRect(.5,.5,M-1,M-1);
 }
 $('minimap').onclick = ev => {
   const r=$('minimap').getBoundingClientRect();
@@ -922,7 +951,8 @@ async function load(){
   $('conn').textContent='fetching'; $('conn').className='badge wait';
   try{
     const j = await (await fetch('/snapshot',{cache:'no-store'})).json();
-    S.w=j.w; S.h=j.h; S.pal=j.palette.length?j.palette:S.pal;
+    if (S.pal.length !== j.palette.length || !S.pal.length) S.pal = j.palette.length ? j.palette : S.pal;
+    fitCanvas(j.w, j.h);
     const bin=atob(j.colors), colors=new Uint8Array(bin.length);
     for (let i=0;i<bin.length;i++) colors[i]=bin.charCodeAt(i);
 
@@ -968,9 +998,11 @@ async function load(){
 
     // накопление горячих тайлов
     if (S.colors){
+      const TN = S.tileN;
       for (let i=0;i<colors.length;i++) if (S.colors[i]!==colors[i]){
         const x=i%S.w, y=(i-x)/S.w;
-        S.tileHot[Math.floor(y/16)*32+Math.floor(x/16)] += 0.12;
+        const k = Math.floor(y/TILE)*TN + Math.floor(x/TILE);
+        if (k >= 0 && k < S.tileHot.length) S.tileHot[k] += 0.12;
       }
     }
 
